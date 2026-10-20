@@ -712,22 +712,35 @@ try {
     }
 
     function Invoke-Update {
-        $newUrl = "$RepoUrl/pcagent.ps1"
-        $tempFile = Join-Path $InstallDir 'pcagent.ps1.new'
-        try {
-            Invoke-WebRequest -Uri $newUrl -OutFile $tempFile -TimeoutSec 30 -UseBasicParsing
-            if ((Get-Item $tempFile).Length -lt 1000) { throw "New file too small" }
-            Move-Item $tempFile $ScriptPath -Force
-            Send-Telegram "[$PCName] Update complete, restarting..."
-            $restartCmd = "Start-Sleep -Seconds 3; try { Stop-ScheduledTask -TaskName '$TaskName' -EA SilentlyContinue } catch {}; Start-Sleep 2; try { Start-ScheduledTask -TaskName '$TaskName' } catch {}"
-            Start-Process powershell.exe -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"$restartCmd`"" -WindowStyle Hidden | Out-Null
-            Write-Log "Update done. Exiting."
-            exit 0
-        } catch {
-            Send-Telegram "[$PCName] Update failed: $($_.Exception.Message)"
-            if (Test-Path $tempFile) { Remove-Item $tempFile -Force -EA SilentlyContinue }
-        }
+    # cache-buster: GitHub CDN giữ file tới 5 phút sau push
+    $bust     = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $newUrl   = "$RepoUrl/pcagent.ps1?t=$bust"
+    $tempFile = Join-Path $InstallDir 'pcagent.ps1.new'
+    try {
+        Invoke-WebRequest -Uri $newUrl -OutFile $tempFile -TimeoutSec 30 -UseBasicParsing
+        $size = (Get-Item $tempFile).Length
+        if ($size -lt 1000) { throw "New file too small ($size bytes)" }
+
+        # đọc version thực tế trong file vừa tải
+        $newContent = Get-Content $tempFile -Raw -Encoding UTF8
+        $newVer = 'unknown'
+        if ($newContent -match '# Version:\s*([\d\.\w\-]+)') { $newVer = $Matches[1] }
+        $hasApi = if ($newContent -match 'SuperAgentUserSession') { 'CreateProcessAsUser' } else { 'TaskScheduler' }
+        Write-Log "Update: downloaded $size bytes, version=$newVer, userSession=$hasApi"
+
+        # không cho phép downgrade im lặng: báo version ngay cho user
+        Send-Telegram "[$PCName] Update: downloaded v$newVer ($hasApi). Restarting..."
+
+        Move-Item $tempFile $ScriptPath -Force
+        $restartCmd = "Start-Sleep -Seconds 3; try { Stop-ScheduledTask -TaskName '$TaskName' -EA SilentlyContinue } catch {}; Start-Sleep 2; try { Start-ScheduledTask -TaskName '$TaskName' } catch {}"
+        Start-Process powershell.exe -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"$restartCmd`"" -WindowStyle Hidden | Out-Null
+        Write-Log "Update done. Exiting."
+        exit 0
+    } catch {
+        Send-Telegram "[$PCName] Update failed: $($_.Exception.Message)"
+        if (Test-Path $tempFile) { Remove-Item $tempFile -Force -EA SilentlyContinue }
     }
+}
 
     $script:UninstallPendingAt = $null
     function Test-UninstallConfirmation {
