@@ -1,5 +1,5 @@
 # =====================================================================
-# RemoteAgent - Telegram-controlled Windows agent (single-file)
+# PCAgent - Telegram-controlled Windows agent (single-file)
 # Usage:
 #   Install:   irm <REPO>/pcagent.ps1 | iex -Install [-BotToken X -ChatId Y -PCName Z]
 #   Uninstall: irm <REPO>/pcagent.ps1 | iex -Uninstall
@@ -19,38 +19,19 @@ param(
 # =====================================================================
 # CONFIG - CHANGE THIS TO YOUR GITHUB RAW URL (no trailing slash)
 # =====================================================================
-$RepoUrl = 'https://raw.githubusercontent.com/minhcuder/remote-control-win11/main'
+$RepoUrl = 'https://raw.githubusercontent.com/USERNAME/REPO/main'
 
 # =====================================================================
 # CONSTANTS
 # =====================================================================
-$InstallDir   = 'C:\ProgramData\RemoteAgent'
+$InstallDir   = 'C:\ProgramData\PCAgent'
 $ConfigPath   = Join-Path $InstallDir 'config.json'
 $OffsetPath   = Join-Path $InstallDir 'offset.txt'
 $ScriptPath   = Join-Path $InstallDir 'pcagent.ps1'
-$TaskName     = 'RemoteAgent'
+$TaskName     = 'PCAgent'
 
-# =====================================================================
-# DISPATCH
-# =====================================================================
-if ($Install)   { & $InstallBlock;   exit $LASTEXITCODE }
-if ($Uninstall) { & $UninstallBlock; exit $LASTEXITCODE }
-if ($Run)       { & $AgentBlock;     exit $LASTEXITCODE }
-
-# Default: show help
-Write-Host ''
-Write-Host '=== RemoteAgent - Usage ===' -ForegroundColor Cyan
-Write-Host ''
-Write-Host 'Cai dat (1 lenh, chay as Admin):'
-Write-Host "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install -BotToken '123:ABC' -ChatId '123456' -PCName 'PC-VanPhong'"
-Write-Host ''
-Write-Host 'Hoac interactive (se hoi token/chatid/pcname):'
-Write-Host "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install"
-Write-Host ''
-Write-Host 'Go cai:'
-Write-Host "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Uninstall"
-Write-Host ''
-exit 0
+# Note: $InstallBlock / $UninstallBlock / $AgentBlock are defined below.
+# Dispatch happens at the very end of the script (after block definitions).
 
 # =====================================================================
 # INSTALL BLOCK
@@ -63,14 +44,7 @@ $InstallBlock = {
                 [Security.Principal.WindowsIdentity]::GetCurrent).IsInRole(
                 [Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
-        Write-Host ''
-        Write-Host '====================================================' -ForegroundColor Red
-        Write-Host ' CAN CHAY VOI QUYEN ADMINISTRATOR' -ForegroundColor Red
-        Write-Host '====================================================' -ForegroundColor Red
-        Write-Host ' Mo PowerShell -> Right-click -> Run as Administrator'
-        Write-Host ' Sau do chay lai lenh cai.'
-        Write-Host ''
-        exit 1
+        throw 'CAN CHAY VOI QUYEN ADMINISTRATOR. Mo PowerShell -> Right-click -> Run as Administrator, sau do chay lai lenh cai.'
     }
 
     # --- Interactive prompts for missing params ---
@@ -86,21 +60,30 @@ $InstallBlock = {
 
     # --- Validate ---
     if ($PCName -notmatch '^[A-Za-z][A-Za-z0-9_\-]{1,31}$') {
-        Write-Host "PCName khong hop le. Chi duoc chu cai, so, gach duoi, gach ngang (2-32 ky tu)." -ForegroundColor Red
-        exit 1
+        throw "PCName khong hop le: '$PCName'. Chi duoc chu cai, so, gach duoi, gach ngang (2-32 ky tu, bat dau bang chu cai)."
     }
-    if ($BotToken -and $BotToken -notmatch '^\d+:[A-Za-z0-9_\-]{30,}$') {
-        Write-Host "Bot Token co ve khong dung dinh dang. Tiep tuc nhung co the khong hoat dong." -ForegroundColor Yellow
+    if (-not $BotToken) {
+        throw 'Thieu Bot Token. Khong the cai dat.'
+    }
+    if ($BotToken -notmatch '^\d+:[A-Za-z0-9_\-]{30,}$') {
+        Write-Host "! Bot Token co ve khong dung dinh dang (vd: 123456789:ABCdef...). Tiep tuc nhung co the khong hoat dong." -ForegroundColor Yellow
     }
     if ($RepoUrl -match 'USERNAME/REPO') {
-        Write-Host "!!! Can sua `$RepoUrl trong script thanh URL GitHub cua ban." -ForegroundColor Red
-        Write-Host "    Mo file pcagent.ps1, dong `$RepoUrl = '...', sua lai, push len GitHub." -ForegroundColor Red
-        Write-Host "    Sau do chay lai lenh cai." -ForegroundColor Red
-        exit 1
+        throw @'
+!!! CHUA SUA $RepoUrl TRONG FILE pcagent.ps1 !!!
+
+Ban can:
+  1. Tai file pcagent.ps1 ve may
+  2. Mo bang notepad/VSCode
+  3. Tim dong: $RepoUrl = 'https://raw.githubusercontent.com/USERNAME/REPO/main'
+  4. Sua USERNAME/REPO thanh GitHub username + repo name cua ban
+  5. Push file len GitHub
+  6. Chay lai lenh cai
+'@
     }
 
     Write-Host ''
-    Write-Host '=== RemoteAgent Installer ===' -ForegroundColor Cyan
+    Write-Host '=== PCAgent Installer ===' -ForegroundColor Cyan
     Write-Host "  PC Name  : $PCName"
     Write-Host "  Chat ID  : $ChatId"
     Write-Host "  Repo URL : $RepoUrl"
@@ -122,8 +105,7 @@ $InstallBlock = {
             Invoke-WebRequest -Uri $scriptUrl -OutFile $ScriptPath -TimeoutSec 30 -UseBasicParsing
             Write-Host '[+] Da download script.' -ForegroundColor Green
         } catch {
-            Write-Host "[-] Khong download duoc: $($_.Exception.Message)" -ForegroundColor Red
-            exit 1
+            throw "Khong download duoc pcagent.ps1 tu $scriptUrl : $($_.Exception.Message). Kiem tra lai RepoUrl trong file config hoac network."
         }
     }
 
@@ -166,7 +148,7 @@ $InstallBlock = {
     Register-ScheduledTask -TaskName $TaskName `
         -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings `
-        -Description 'RemoteAgent - Telegram remote control agent' | Out-Null
+        -Description 'PCAgent - Telegram remote control agent' | Out-Null
 
     Start-ScheduledTask -TaskName $TaskName
     Write-Host '[+] Scheduled task da tao va chay.' -ForegroundColor Green
@@ -191,17 +173,17 @@ $InstallBlock = {
 # UNINSTALL BLOCK
 # =====================================================================
 $UninstallBlock = {
-    $ErrorActionPreference = 'Continue'
+    $ErrorActionPreference = 'Stop'
 
     $isAdmin = ([Security.Principal.WindowsPrincipal] `
                 [Security.Principal.WindowsIdentity]::GetCurrent).IsInRole(
                 [Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
-        Write-Host 'CAN CHAY VOI QUYEN ADMINISTRATOR.' -ForegroundColor Red
-        exit 1
+        throw 'CAN CHAY VOI QUYEN ADMINISTRATOR. Mo PowerShell as Admin roi chay lai.'
     }
 
-    Write-Host '[*] Dang go cai RemoteAgent...' -ForegroundColor Cyan
+    $ErrorActionPreference = 'Continue'
+    Write-Host '[*] Dang go cai PCAgent...' -ForegroundColor Cyan
 
     try {
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -343,7 +325,7 @@ $AgentBlock = {
         }
         if (-not $username) { return $false }
 
-        $taskName = "RemoteAgent_User_$(Get-Random)"
+        $taskName = "PCAgent_User_$(Get-Random)"
         $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
                      -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TempScriptPath`""
         $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(2)
@@ -408,7 +390,7 @@ Add-Type -AssemblyName System.Windows.Forms,System.Drawing
         $tmpScript = Join-Path $InstallDir '_msg.ps1'
         @"
 Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.MessageBox]::Show('$safe', 'RemoteAgent Message', 'OK', 'Information') | Out-Null
+[System.Windows.Forms.MessageBox]::Show('$safe', 'PCAgent Message', 'OK', 'Information') | Out-Null
 "@ | Out-File $tmpScript -Encoding UTF8
         return Invoke-InUserSession -TempScriptPath $tmpScript
     }
@@ -506,11 +488,11 @@ Add-Type -AssemblyName System.Windows.Forms
                     switch ($cmd) {
                         '/shutdown' {
                             Send-Telegram "[$PCName] Dang shutdown..."
-                            shutdown /s /t 3 /f /c 'RemoteAgent: Remote shutdown'
+                            shutdown /s /t 3 /f /c 'PCAgent: Remote shutdown'
                         }
                         '/restart' {
                             Send-Telegram "[$PCName] Dang restart..."
-                            shutdown /r /t 3 /f /c 'RemoteAgent: Remote restart'
+                            shutdown /r /t 3 /f /c 'PCAgent: Remote restart'
                         }
                         '/lock' {
                             $ok = Invoke-Lock
@@ -577,3 +559,75 @@ Add-Type -AssemblyName System.Windows.Forms
         }
     }
 }
+
+# =====================================================================
+# DISPATCH (must be AFTER all block definitions above)
+# =====================================================================
+function Pause-Exit {
+    param([string]$Msg = 'Nhan Enter de thoat...')
+    Write-Host ''
+    try { Read-Host $Msg | Out-Null } catch { }
+}
+
+if ($Install) {
+    try {
+        & $InstallBlock
+        $code = $LASTEXITCODE
+        if ($null -eq $code) { $code = 0 }
+        Pause-Exit
+        exit $code
+    } catch {
+        Write-Host ''
+        Write-Host '===================================================' -ForegroundColor Red
+        Write-Host ' LOI KHI CAI DAT:' -ForegroundColor Red
+        Write-Host '===================================================' -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host 'Stack trace:' -ForegroundColor DarkGray
+        Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
+        Pause-Exit 'Nhan Enter de thoat...'
+        exit 1
+    }
+}
+
+if ($Uninstall) {
+    try {
+        & $UninstallBlock
+        Pause-Exit
+        exit 0
+    } catch {
+        Write-Host ''
+        Write-Host '===================================================' -ForegroundColor Red
+        Write-Host ' LOI KHI GO CAI:' -ForegroundColor Red
+        Write-Host '===================================================' -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Yellow
+        Pause-Exit 'Nhan Enter de thoat...'
+        exit 1
+    }
+}
+
+if ($Run) {
+    try {
+        & $AgentBlock
+    } catch {
+        # Agent loop should never exit cleanly; if we get here, log and restart
+        Start-Sleep -Seconds 10
+        exit 1
+    }
+    exit 0
+}
+
+# Default: show help
+Write-Host ''
+Write-Host '=== PCAgent - Usage ===' -ForegroundColor Cyan
+Write-Host ''
+Write-Host 'Cai dat (1 lenh, chay as Admin):'
+Write-Host "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install -BotToken '123:ABC' -ChatId '123456' -PCName 'PC-VanPhong'"
+Write-Host ''
+Write-Host 'Hoac interactive (se hoi token/chatid/pcname):'
+Write-Host "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install"
+Write-Host ''
+Write-Host 'Go cai:'
+Write-Host "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Uninstall"
+Write-Host ''
+exit 0
