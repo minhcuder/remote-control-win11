@@ -38,7 +38,58 @@ try {
  $ConfigPath   = Join-Path $InstallDir 'config.json'
  $OffsetPath   = Join-Path $InstallDir 'offset.txt'
  $ScriptPath   = Join-Path $InstallDir 'pcagent.ps1'
+ $LogPath      = Join-Path $InstallDir 'agent.log'
  $TaskName     = 'PCAgent'
+
+# =====================================================================
+# AUTO-ELEVATE: if -Install/-Uninstall and not admin, relaunch as admin
+# =====================================================================
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return ([Security.Principal.WindowsPrincipal] $id).IsInRole(
+           [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Invoke-SelfElevation {
+    # Rebuild the original command line and relaunch via Start-Process -Verb RunAs
+    # Preserves all original parameters (-Install, -BotToken, -ChatId, -PCName, ...)
+    $argString = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    foreach ($key in $PSBoundParameters.Keys) {
+        $val = $PSBoundParameters[$key]
+        if ($val -is [System.Management.Automation.SwitchParameter]) {
+            if ($val.IsPresent) { $argString += " -$key" }
+        } else {
+            $escaped = $val -replace "'", "''"
+            $argString += " -$key '$escaped'"
+        }
+    }
+
+    Write-Host ''
+    Write-Host '[*] Chua co quyen Admin. Dang xin quyen (UAC)...' -ForegroundColor Yellow
+    Write-Host '    Neu hoi dialog UAC, click Yes de cho phep.' -ForegroundColor Yellow
+    Write-Host ''
+
+    try {
+        $p = Start-Process -FilePath 'powershell.exe' `
+                            -ArgumentList $argString `
+                            -Verb RunAs `
+                            -PassThru `
+                            -Wait
+        exit $p.ExitCode
+    } catch {
+        Write-Host ''
+        Write-Host '[-] Ban da tu choi UAC hoac khong the elevate.' -ForegroundColor Red
+        Write-Host '    Mo PowerShell -> Right-click -> Run as Administrator -> chay lai lenh.' -ForegroundColor Red
+        Read-Host 'Nhan Enter de thoat'
+        exit 1
+    }
+}
+
+# Auto-elevate for Install/Uninstall modes
+if (($Install -or $Uninstall) -and -not (Test-IsAdmin)) {
+    Invoke-SelfElevation
+    # (function above never returns - it exits)
+}
 
 # Note: $InstallBlock / $UninstallBlock / $AgentBlock are defined below.
 # Dispatch happens at the very end of the script (after block definitions).
@@ -49,20 +100,14 @@ try {
  $InstallBlock = {
     $ErrorActionPreference = 'Stop'
 
-    # --- Admin check ---
-    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $isAdmin = ([Security.Principal.WindowsPrincipal] $currentIdentity).IsInRole(
-                [Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isAdmin) {
-        throw 'CAN CHAY VOI QUYEN ADMINISTRATOR. Mo PowerShell -> Right-click -> Run as Administrator, sau do chay lai lenh cai.'
-    }
+    # (Admin check done by auto-elevate above)
 
     # --- Interactive prompts for missing params ---
     if (-not $BotToken) {
         $BotToken = Read-Host 'Bot Token (vd: 123456789:ABCdef...)'
     }
     if (-not $ChatId) {
-        $ChatId = Read-Host 'Chat ID (vd: 123456789)'
+        $ChatId = Read-Host 'Chat ID (vd: 123456789, hoac -100xxxxxx cho group)'
     }
     if (-not $PCName) {
         $PCName = Read-Host "PC Name (vd: PC-VanPhong, Laptop-NV)"
@@ -163,6 +208,28 @@ Ban can:
     Start-ScheduledTask -TaskName $TaskName
     Write-Host '[+] Scheduled task da tao va chay.' -ForegroundColor Green
 
+    # --- Wait & verify agent started + sent Telegram message ---
+    Write-Host ''
+    Write-Host '[*] Dang cho agent gui thong bao Telegram (toi da 20s)...' -ForegroundColor Cyan
+    $verified = $false
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Seconds 1
+        if (Test-Path $LogPath) {
+            $logTail = Get-Content $LogPath -Tail 20 -ErrorAction SilentlyContinue
+            if ($logTail -match 'sendMessage OK') {
+                $verified = $true
+                break
+            }
+            if ($logTail -match 'sendMessage FAIL') {
+                Write-Host '[!] Agent da gui Telegram nhung THAT BAI. Xem log:' -ForegroundColor Red
+                $logTail | Where-Object { $_ -match 'FAIL|ERROR' } | Select-Object -Last 5 | ForEach-Object {
+                    Write-Host "    $_" -ForegroundColor Yellow
+                }
+                break
+            }
+        }
+    }
+
     Write-Host ''
     Write-Host '====================================================' -ForegroundColor Green
     Write-Host ' CAI DAT HOAN TAT' -ForegroundColor Green
@@ -170,9 +237,20 @@ Ban can:
     Write-Host " Folder          : $InstallDir"
     Write-Host " Config          : $ConfigPath"
     Write-Host " Script          : $ScriptPath"
+    Write-Host " Log             : $LogPath"
     Write-Host " Scheduled Task  : $TaskName (SYSTEM, AtStartup)"
     Write-Host ""
-    Write-Host " Telegram se nhan thong bao tu [$PCName] trong vai giay."
+    if ($verified) {
+        Write-Host " [v] Agent da gui thong bao Telegram thanh cong!" -ForegroundColor Green
+        Write-Host "     Kiem tra Telegram, neu van khong nhan dc tin:" -ForegroundColor Yellow
+        Write-Host "       1. Bot da duoc add vao group (neu dung group chat)?" -ForegroundColor Yellow
+        Write-Host "       2. Group privacy: /setprivacy = Disabled trong @BotFather?" -ForegroundColor Yellow
+        Write-Host "       3. Gui /status cho bot de kiem tra 2-chieu" -ForegroundColor Yellow
+    } else {
+        Write-Host " [!] Chua xac nhan duoc thong bao Telegram da gui." -ForegroundColor Yellow
+        Write-Host "     Xem log chi tiet: $LogPath" -ForegroundColor Yellow
+        Write-Host "     Hoac gui lenh: /log cho bot qua Telegram (neu bot da reply)" -ForegroundColor Yellow
+    }
     Write-Host ""
     Write-Host " De go cai:"
     Write-Host "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Uninstall"
@@ -183,15 +261,6 @@ Ban can:
 # UNINSTALL BLOCK
 # =====================================================================
  $UninstallBlock = {
-    $ErrorActionPreference = 'Stop'
-
-    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $isAdmin = ([Security.Principal.WindowsPrincipal] $currentIdentity).IsInRole(
-                [Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isAdmin) {
-        throw 'CAN CHAY VOI QUYEN ADMINISTRATOR. Mo PowerShell as Admin roi chay lai.'
-    }
-
     $ErrorActionPreference = 'Continue'
     Write-Host '[*] Dang go cai PCAgent...' -ForegroundColor Cyan
 
@@ -234,13 +303,33 @@ Ban can:
     $script:PCName   = $Config.PCName
     $script:RepoUrl  = $Config.RepoUrl
 
-    if (-not $BotToken -or -not $ChatId -or -not $PCName) { exit 1 }
+    if (-not $BotToken -or -not $ChatId -or -not $PCName) {
+        try { "[$(Get-Date -Format o)] EXIT: Missing config (BotToken/ChatId/PCName)" | Out-File $LogPath -Append -Encoding UTF8 } catch {}
+        exit 1
+    }
 
     # --- Load last offset ---
     $script:Offset = 0
     if (Test-Path $OffsetPath) {
         try { $script:Offset = [int](Get-Content $OffsetPath -First 1) } catch { $script:Offset = 0 }
     }
+
+    # --- Logging function ---
+    function Write-Log {
+        param([string]$Message)
+        try {
+            $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
+            $line | Out-File $LogPath -Append -Encoding UTF8
+            # Rotate log if > 2MB
+            if ((Get-Item $LogPath -ErrorAction SilentlyContinue).Length -gt 2MB) {
+                $bak = "$LogPath.1"
+                if (Test-Path $bak) { Remove-Item $bak -Force }
+                Rename-Item $LogPath $bak -Force
+            }
+        } catch { }
+    }
+
+    Write-Log "=== Agent khoi dong (PCName=$PCName, ChatId=$ChatId, RepoUrl=$RepoUrl) ==="
 
     # --- Helper functions ---
     function Send-Telegram {
@@ -250,7 +339,12 @@ Ban can:
         try {
             Invoke-RestMethod -Uri "https://api.telegram.org/bot$BotToken/sendMessage" `
                 -Method Post -Body $body -TimeoutSec 15 | Out-Null
-        } catch { }
+            Write-Log "Telegram sendMessage OK (len=$($Text.Length))"
+            return $true
+        } catch {
+            Write-Log "Telegram sendMessage FAIL: $($_.Exception.Message)"
+            return $false
+        }
     }
 
     function Send-TelegramPhoto {
@@ -265,14 +359,20 @@ Ban can:
 
     function Wait-Network {
         $maxAttempts = 0
+        Write-Log "Wait-Network: bat dau cho mang..."
         while ($true) {
             try {
                 $null = Invoke-RestMethod -Uri 'https://api.telegram.org' -TimeoutSec 5
+                Write-Log "Wait-Network: OK co mang (sau $maxAttempts lan thu)"
                 return $true
             } catch {
                 Start-Sleep -Seconds 3
                 $maxAttempts++
-                if ($maxAttempts -gt 600) { return $false }
+                if ($maxAttempts % 10 -eq 0) { Write-Log "Wait-Network: van cho... ($maxAttempts lan)" }
+                if ($maxAttempts -gt 600) {
+                    Write-Log "Wait-Network: TIMEOUT sau 30 phut, bo qua"
+                    return $false
+                }
             }
         }
     }
@@ -438,13 +538,20 @@ Add-Type -AssemblyName System.Windows.Forms
 
     # --- Boot notification ---
     Wait-Network
-    Send-Telegram (Get-PCInfo)
+    $bootMsg = Get-PCInfo
+    $bootOk = Send-Telegram $bootMsg
+    if (-not $bootOk) {
+        Write-Log "Boot notification FAIL - kiem tra BotToken/ChatId/network"
+    }
 
     # --- Main polling loop ---
+    $pollCount = 0
     while ($true) {
         try {
             $url = "https://api.telegram.org/bot$BotToken/getUpdates?offset=$Offset&timeout=30"
             $response = Invoke-RestMethod -Uri $url -TimeoutSec 35
+            $pollCount++
+            if ($pollCount % 20 -eq 0) { Write-Log "Polling OK, $pollCount cycles, offset=$Offset" }
 
             if ($response.result) {
                 foreach ($update in $response.result) {
@@ -455,10 +562,15 @@ Add-Type -AssemblyName System.Windows.Forms
                     if (-not $update.message.text) { continue }
 
                     $fromChatId = [string]$update.message.chat.id
-                    if ($fromChatId -ne $ChatId) { continue }
+                    if ($fromChatId -ne $ChatId) {
+                        Write-Log "REJECT message from chat_id=$fromChatId (expected=$ChatId)"
+                        continue
+                    }
 
                     $text = $update.message.text.Trim()
                     if (-not $text.StartsWith('/')) { continue }
+
+                    Write-Log "RECV command: $text"
 
                     # --- Parse: /cmd [@pcname] [args...] ---
                     $parts = $text -split '\s+'
@@ -541,6 +653,16 @@ Add-Type -AssemblyName System.Windows.Forms
                         '/update' {
                             Invoke-Update
                         }
+                        '/log' {
+                            if (Test-Path $LogPath) {
+                                $lines = Get-Content $LogPath -Tail 50
+                                $text = ($lines -join "`n")
+                                if ($text.Length -gt 3900) { $text = $text.Substring($text.Length - 3900) }
+                                Send-Telegram "[$PCName] Log 50 dong cuoi:`n`n$text"
+                            } else {
+                                Send-Telegram "[$PCName] Chua co log file"
+                            }
+                        }
                         '/help' {
                             $help = @"
 [$PCName] *Lenh available:*
@@ -552,6 +674,7 @@ Add-Type -AssemblyName System.Windows.Forms
 /msg   @pc <text>   - Hien thi popup (can @)
 /exec  @pc <cmd>    - Chay lenh PowerShell (can @)
 /update  [pc]       - Tu update tu GitHub
+/log     [pc]       - Xem 50 dong log cuoi
 /help               - Hien thi lenh
 
 [pc] = ten PC (vd: PC-VanPhong), bo qua = TAT CA PC.
@@ -565,6 +688,7 @@ Add-Type -AssemblyName System.Windows.Forms
             }
         }
         catch {
+            Write-Log "POLL ERROR: $($_.Exception.Message)"
             Start-Sleep -Seconds 5
         }
     }
@@ -620,7 +744,6 @@ if ($Run) {
     try {
         & $AgentBlock
     } catch {
-        # Agent loop should never exit cleanly; if we get here, log and restart
         Start-Sleep -Seconds 10
         exit 1
     }
