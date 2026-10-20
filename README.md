@@ -1,4 +1,3 @@
-````markdown
 # PCAgent — Điều khiển PC Windows từ xa qua Telegram
 
 Script PowerShell duy nhất chạy ngầm trên Windows, nhận lệnh từ Telegram bot để tắt/khởi động lại máy, khóa màn hình, chụp màn hình, hiển thị popup, chạy lệnh PowerShell, xem log, và tự update. Chạy dưới tài khoản SYSTEM qua Scheduled Task tại boot, auto-restart nếu bị kill, không cần cấp quyền admin lần 2 sau khi cài.
@@ -725,6 +724,3 @@ Không có telemetry, không có analytics, không gửi data đi đâu khác.
 Dùng cho mục đích quản trị PC cá nhân và PC trong tổ chức của bạn. Tác giả không chịu trách nhiệm nếu dùng sai mục đích (theo dõi người khác mà không được đồng ý, malware, tấn công hệ thống không sở hữu...). Tuân thủ pháp luật sở tại.
 
 Repo: thay URL GitHub của bạn vào `$RepoUrl` trong file `pcagent.ps1` trước khi push.
-````
-
-Anh copy từ ````markdown ở đầu tới ```` ở cuối, dán vào file `README.md`, push lên cùng repo với `pcagent.ps1` là xong.
