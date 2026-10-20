@@ -19,7 +19,17 @@ param(
 # =====================================================================
 # CONFIG - CHANGE THIS TO YOUR GITHUB RAW URL (no trailing slash)
 # =====================================================================
-$RepoUrl = 'https://raw.githubusercontent.com/USERNAME/REPO/main'
+$RepoUrl = 'https://raw.githubusercontent.com/minhcuder/remote-control-win11/main'
+
+# =====================================================================
+# TLS 1.2 REQUIRED for Windows PowerShell 5.1 (Telegram + GitHub need it)
+# =====================================================================
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+} catch {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+}
 
 # =====================================================================
 # CONSTANTS
@@ -40,8 +50,8 @@ $InstallBlock = {
     $ErrorActionPreference = 'Stop'
 
     # --- Admin check ---
-    $isAdmin = ([Security.Principal.WindowsPrincipal] `
-                [Security.Principal.WindowsIdentity]::GetCurrent).IsInRole(
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $isAdmin = ([Security.Principal.WindowsPrincipal] $currentIdentity).IsInRole(
                 [Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
         throw 'CAN CHAY VOI QUYEN ADMINISTRATOR. Mo PowerShell -> Right-click -> Run as Administrator, sau do chay lai lenh cai.'
@@ -175,8 +185,8 @@ Ban can:
 $UninstallBlock = {
     $ErrorActionPreference = 'Stop'
 
-    $isAdmin = ([Security.Principal.WindowsPrincipal] `
-                [Security.Principal.WindowsIdentity]::GetCurrent).IsInRole(
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $isAdmin = ([Security.Principal.WindowsPrincipal] $currentIdentity).IsInRole(
                 [Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
         throw 'CAN CHAY VOI QUYEN ADMINISTRATOR. Mo PowerShell as Admin roi chay lai.'
