@@ -19,7 +19,7 @@ param(
 # =====================================================================
 # CONFIG - CHANGE THIS TO YOUR GITHUB RAW URL (no trailing slash)
 # =====================================================================
-$RepoUrl = 'https://raw.githubusercontent.com/minhcuder/remote-control-win11/main'
+ $RepoUrl = 'https://raw.githubusercontent.com/minhcuder/remote-control-win11/main'
 
 # =====================================================================
 # TLS 1.2 REQUIRED for Windows PowerShell 5.1 (Telegram + GitHub need it)
@@ -34,11 +34,11 @@ try {
 # =====================================================================
 # CONSTANTS
 # =====================================================================
-$InstallDir   = 'C:\ProgramData\PCAgent'
-$ConfigPath   = Join-Path $InstallDir 'config.json'
-$OffsetPath   = Join-Path $InstallDir 'offset.txt'
-$ScriptPath   = Join-Path $InstallDir 'pcagent.ps1'
-$TaskName     = 'PCAgent'
+ $InstallDir   = 'C:\ProgramData\PCAgent'
+ $ConfigPath   = Join-Path $InstallDir 'config.json'
+ $OffsetPath   = Join-Path $InstallDir 'offset.txt'
+ $ScriptPath   = Join-Path $InstallDir 'pcagent.ps1'
+ $TaskName     = 'PCAgent'
 
 # Note: $InstallBlock / $UninstallBlock / $AgentBlock are defined below.
 # Dispatch happens at the very end of the script (after block definitions).
@@ -46,7 +46,7 @@ $TaskName     = 'PCAgent'
 # =====================================================================
 # INSTALL BLOCK
 # =====================================================================
-$InstallBlock = {
+ $InstallBlock = {
     $ErrorActionPreference = 'Stop'
 
     # --- Admin check ---
@@ -182,7 +182,7 @@ Ban can:
 # =====================================================================
 # UNINSTALL BLOCK
 # =====================================================================
-$UninstallBlock = {
+ $UninstallBlock = {
     $ErrorActionPreference = 'Stop'
 
     $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -222,7 +222,7 @@ $UninstallBlock = {
 # =====================================================================
 # AGENT BLOCK (run mode)
 # =====================================================================
-$AgentBlock = {
+ $AgentBlock = {
     # --- Load config ---
     if (-not (Test-Path $ConfigPath)) { exit 1 }
     try {
