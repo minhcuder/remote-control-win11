@@ -670,7 +670,7 @@ Add-Type -AssemblyName System.Windows.Forms
         }
     }
 
-    function Invoke-Update {
+        function Invoke-Update {
         $newUrl = "$RepoUrl/pcagent.ps1"
         $tempFile = Join-Path $InstallDir 'pcagent.ps1.new'
         try {
@@ -680,12 +680,43 @@ Add-Type -AssemblyName System.Windows.Forms
             Move-Item $tempFile $ScriptPath -Force
             Send-Telegram "[$PCName] Update complete, restarting agent..."
 
+            # Spawn detached restart process, then EXIT IMMEDIATELY.
+            # Do NOT continue polling loop - agent process will be killed by the
+            # restart command below; continuing to poll could re-process stale
+            # commands (e.g. /uninstall) and cause unintended self-destruction.
             $restartCmd = "Start-Sleep -Seconds 3; try { Stop-ScheduledTask -TaskName '$TaskName' -ErrorAction SilentlyContinue } catch {}; Start-Sleep -Seconds 2; try { Start-ScheduledTask -TaskName '$TaskName' } catch {}"
             Start-Process powershell.exe -ArgumentList "-NoProfile -WindowStyle Hidden -Command `"$restartCmd`"" -WindowStyle Hidden | Out-Null
+
+            Write-Log "Update done. Agent exiting to allow restart."
+            exit 0
         } catch {
             Send-Telegram "[$PCName] Update failed: $($_.Exception.Message)"
             if (Test-Path $tempFile) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
         }
+    }
+
+    # --- Pending uninstall confirmation tracking ---
+    # /uninstall requires confirmation: send once -> agent replies "confirm within 10s"
+    # Send again within 10s -> actual uninstall triggers
+    $script:UninstallPendingAt = $null
+
+    function Test-UninstallConfirmation {
+        # Returns $true if user has confirmed uninstall within last 10 seconds
+        if ($script:UninstallPendingAt) {
+            $elapsed = (Get-Date) - $script:UninstallPendingAt
+            if ($elapsed.TotalSeconds -le 10) {
+                return $true
+            }
+        }
+        return $false
+    }
+
+    function Set-UninstallPending {
+        $script:UninstallPendingAt = Get-Date
+    }
+
+    function Clear-UninstallPending {
+        $script:UninstallPendingAt = $null
     }
 
     function Invoke-SelfUninstall {
@@ -844,9 +875,21 @@ if (Test-Path '$InstallDir') {
                             Invoke-Update
                         }
                         '/uninstall' {
-                            Send-Telegram "[$PCName] Uninstalling in 3s... Scheduled task, script, config, and logs will be removed. Agent will stop after this message."
-                            Invoke-SelfUninstall
-                            exit 0
+                            # Two-step confirmation:
+                            # - First /uninstall: set pending flag, ask user to confirm within 10s
+                            # - Second /uninstall within 10s: actual uninstall
+                            if (Test-UninstallConfirmation) {
+                                # Confirmed - do real uninstall
+                                Clear-UninstallPending
+                                Send-Telegram "[$PCName] Uninstall CONFIRMED. Removing in 3s... Scheduled task, script, config, and logs will be deleted. Agent will stop after this message."
+                                Invoke-SelfUninstall
+                                exit 0
+                            } else {
+                                # First call - ask for confirmation
+                                Set-UninstallPending
+                                Send-Telegram "[$PCName] Uninstall requested. To CONFIRM, send /uninstall again within 10 seconds. Otherwise it will be cancelled."
+                                Write-Log "Uninstall pending confirmation (user must re-send /uninstall within 10s)"
+                            }
                         }
                         '/log' {
                             if (Test-Path $LogPath) {
@@ -870,13 +913,14 @@ if (Test-Path '$InstallDir') {
 /msgall <text>      - Show popup on ALL PCs
 /exec  @pc <cmd>    - Run PowerShell command (requires @)
 /update  [pc]       - Self-update from GitHub
-/uninstall [pc]     - REMOVE agent from PC (deletes everything)
+/uninstall [pc]     - REMOVE agent (requires 2x confirmation within 10s)
 /log     [pc]       - Show last 50 log lines
 /help               - Show this help
 
 [pc] = PC name (e.g. PC-Office), omit = ALL PCs.
 /msg and /exec REQUIRE @pc. /msgall does not need @pc.
 /uninstall removes agent completely - cannot be undone remotely.
+/uninstall requires sending the command TWICE within 10 seconds to confirm.
 "@
                             Send-Telegram $help
                         }
