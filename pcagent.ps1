@@ -46,7 +46,7 @@ try {
  $TaskName     = 'SuperAgent'
 
 # =====================================================================
-# Silent-aware logging: in -Silent mode, suppress all console output
+# Silent-aware logging
 # =====================================================================
 if ($Silent) {
     $ErrorActionPreference = 'SilentlyContinue'
@@ -63,7 +63,7 @@ function Write-Msg {
 }
 
 # =====================================================================
-# AUTO-ELEVATE: if -Install/-Uninstall and not admin, relaunch as admin
+# AUTO-ELEVATE
 # =====================================================================
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -127,15 +127,8 @@ if (($Install -or $Uninstall) -and -not (Test-IsAdmin)) {
         $PCName = Read-Host "PC Name (e.g. PC-Office, Laptop-NV)"
     }
 
-    if ($PCName -notmatch '^[A-Za-z][A-Za-z0-9_\-]{1,31}$') {
-        throw "Invalid PCName: '$PCName'. Allowed: letters, digits, underscore, dash (2-32 chars, must start with a letter)."
-    }
-    if (-not $BotToken) {
-        throw 'Bot Token is required.'
-    }
-    if ($BotToken -notmatch '^\d+:[A-Za-z0-9_\-]{30,}$') {
-        Write-Msg "! Bot Token format looks invalid. Continuing but may not work." -Color Yellow
-    }
+    # Note: full validation happens AFTER old-config reuse (below)
+
     if ($RepoUrl -match 'USERNAME/REPO') {
         throw @'
 !!! $RepoUrl NOT UPDATED IN pcagent.ps1 !!!
@@ -163,11 +156,14 @@ You must:
     }
 
     # --- Detect existing installation and clean up before reinstall ---
+    # Check both SuperAgent (current) and PCAgent (legacy) task names
     $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $legacyTask   = Get-ScheduledTask -TaskName 'PCAgent' -ErrorAction SilentlyContinue
     $existingConfig = Test-Path $ConfigPath
-    if ($existingTask -or $existingConfig) {
+    if ($existingTask -or $existingConfig -or $legacyTask) {
         Write-Msg '[*] Existing installation detected. Cleaning up before reinstall...' -Color Yellow
 
+        # Stop and remove old scheduled task (current name)
         if ($existingTask) {
             try {
                 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -176,16 +172,33 @@ You must:
             } catch { }
         }
 
-        # Kill any running agent processes
+        # Also remove legacy task name (PCAgent from earlier versions)
+        if ($legacyTask) {
+            try {
+                Stop-ScheduledTask -TaskName 'PCAgent' -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskName 'PCAgent' -Confirm:$false -ErrorAction SilentlyContinue
+                Write-Msg '[+] Legacy PCAgent task removed.' -Color Green
+            } catch { }
+        }
+
+        # Kill ALL powershell processes running pcagent.ps1 (regardless of args)
+        $killedCount = 0
         Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -like '*pcagent.ps1* -Run*' } |
+            Where-Object { $_.CommandLine -and ($_.CommandLine -like '*pcagent.ps1*') } |
             ForEach-Object {
-                try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch { }
+                try {
+                    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+                    $killedCount++
+                } catch { }
             }
-        Start-Sleep -Seconds 1
+        if ($killedCount -gt 0) {
+            Write-Msg "[+] Killed $killedCount old agent process(es)." -Color Green
+        }
+        Start-Sleep -Seconds 2
 
         # Preserve old config if user did not provide new values
-        if ($existingConfig -and -not $BotToken) {
+        # (critical for silent reinstall: skip -BotToken/-ChatId/-PCName, reuse from old config)
+        if ($existingConfig) {
             try {
                 $oldCfg = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
                 if (-not $BotToken -and $oldCfg.BotToken) { $BotToken = $oldCfg.BotToken }
@@ -199,6 +212,17 @@ You must:
         Get-ChildItem -Path $InstallDir -Force -ErrorAction SilentlyContinue |
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
         Write-Msg '[+] Old files wiped.' -Color Green
+    }
+
+    # --- Now validate (after old config reuse, so silent reinstall without params works) ---
+    if ($PCName -notmatch '^[A-Za-z][A-Za-z0-9_\-]{1,31}$') {
+        throw "Invalid PCName: '$PCName'. Allowed: letters, digits, underscore, dash (2-32 chars, must start with a letter)."
+    }
+    if (-not $BotToken) {
+        throw 'Bot Token is required. Provide -BotToken or run without -Silent to be prompted.'
+    }
+    if ($BotToken -notmatch '^\d+:[A-Za-z0-9_\-]{30,}$') {
+        Write-Msg "! Bot Token format looks invalid. Continuing but may not work." -Color Yellow
     }
 
     # --- Save script locally ---
@@ -222,7 +246,7 @@ You must:
         ChatId      = $ChatId
         PCName      = $PCName
         RepoUrl     = $RepoUrl.TrimEnd('/')
-        Version     = '2.2.0'
+        Version     = '2.2.1'
         InstalledAt = (Get-Date -Format 'o')
     }
     $Config | ConvertTo-Json | Out-File $ConfigPath -Encoding UTF8
@@ -329,8 +353,17 @@ You must:
         Write-Msg '[.] No scheduled task to remove.' -Color Yellow
     }
 
+    # Also remove legacy PCAgent task if exists
+    if (Get-ScheduledTask -TaskName 'PCAgent' -ErrorAction SilentlyContinue) {
+        try {
+            Stop-ScheduledTask -TaskName 'PCAgent' -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName 'PCAgent' -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Msg '[+] Legacy PCAgent task removed.' -Color Green
+        } catch { }
+    }
+
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*pcagent.ps1* -Run*' } |
+        Where-Object { $_.CommandLine -and ($_.CommandLine -like '*pcagent.ps1*') } |
         ForEach-Object {
             try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch { }
         }
@@ -549,8 +582,6 @@ You must:
         $tmpScript = Join-Path $InstallDir '_shot.ps1'
 
         # DPI-aware screenshot, full virtual screen (multi-monitor supported)
-        # Uses SM_XVIRTUALSCREEN(76) / SM_YVIRTUALSCREEN(77) / SM_CXVIRTUALSCREEN(78) / SM_CYVIRTUALSCREEN(79)
-        # to capture ALL monitors, not just primary
         $scriptContent = @"
 param([string]`$OutPath)
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
@@ -584,13 +615,10 @@ Add-Type `$csCode
 "@
         $scriptContent | Out-File $tmpScript -Encoding UTF8
 
-        # Run in a fresh child process to isolate DPI awareness
-        # (calling SetProcessDPIAware in parent powershell.exe affects cursor rendering)
         Write-Log "Screenshot: launching isolated process for $outFile"
         $ok = Invoke-InUserSessionWithArgs -TempScriptPath $tmpScript -ArgumentList $outFile
         if (-not $ok) {
             try {
-                # Fallback: run via cmd.exe wrapper (truly isolated process)
                 $cmdLine = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tmpScript`" `"$outFile`""
                 $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList "/c", $cmdLine -WindowStyle Hidden -PassThru -Wait
                 $ok = ($proc.ExitCode -eq 0)
@@ -661,7 +689,6 @@ Add-Type -AssemblyName System.Windows.Forms
     }
 
     function Invoke-SelfUninstall {
-        # Remote uninstall: agent removes itself, scheduled task, and all files
         Write-Log "Self-uninstall triggered - spawning cleanup process"
 
         $uninstallCmd = @"
@@ -672,7 +699,7 @@ try {
 } catch {}
 Start-Sleep -Seconds 1
 Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { `$_.CommandLine -like '*pcagent.ps1* -Run*' } |
+    Where-Object { `$_.CommandLine -like '*pcagent.ps1*' } |
     ForEach-Object { try { Stop-Process -Id `$_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
 Start-Sleep -Seconds 1
 if (Test-Path '$InstallDir') {
